@@ -1,0 +1,9 @@
+created: 2026-08-09
+title: Worktrunk worktree management in pi
+intro: "This release lets you manage Worktrunk worktrees directly from pi and continue\
+  \ sessions in existing or newly created worktrees. The new /worktree command and\
+  \ agent tool preserve Worktrunk\u2019s safety safeguards while making worktree-based\
+  \ workflows easier to control."
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.1.0
