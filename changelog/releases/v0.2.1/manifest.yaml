@@ -1,0 +1,9 @@
+created: 2026-08-13
+title: Native Worktrunk tool output
+intro: >-
+  Pi's TUI now presents Worktrunk's native output for every agent tool action while
+  preserving structured JSON for the model. This release also supports the current
+  Worktrunk removal result schema.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.2.0
