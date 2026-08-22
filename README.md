@@ -1,8 +1,8 @@
 # 🚦 pi-worktrunk
 
-A [pi](https://github.com/earendil-works/pi-mono/tree/main/packages/coding-agent)
-extension that brings Worktrunk status markers, interactive commands, session
-continuation, and agent worktree tools under one roof.
+A [Pi](https://pi.dev) extension that brings Worktrunk status markers,
+interactive commands, session continuation, and agent worktree tools under one
+roof.
 
 ## 🚀 Installation
 
