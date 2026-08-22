@@ -1,0 +1,9 @@
+created: 2026-08-22
+title: Worktrunk aliases in Pi
+intro: >-
+  This release exposes configured Worktrunk aliases as `/worktree` subcommands and
+  improves recovery when a session's worktree disappears. It also makes Worktrunk
+  tool calls easier to scan with clearer, bolder headers.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.2.1
