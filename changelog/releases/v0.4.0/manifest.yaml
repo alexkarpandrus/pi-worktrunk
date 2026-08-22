@@ -1,0 +1,9 @@
+created: 2026-08-22
+title: Run Worktrunk aliases from Pi
+intro: >-
+  This release lets Pi agents run configured Worktrunk aliases with clear confirmation,
+  shortens the interactive command to `/wt`, and makes Worktrunk tool calls easier
+  to scan with consistent colors.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.3.0
