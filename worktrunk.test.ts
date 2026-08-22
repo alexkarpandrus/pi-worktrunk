@@ -18,6 +18,7 @@ import extension, {
   markerArgs,
   materializeSessionSnapshot,
   parseAliasArguments,
+  parseWorktrunkAliasMetadata,
   parseWorktrunkAliasNames,
 } from "./worktrunk.ts";
 
@@ -85,6 +86,42 @@ Run wt config alias show for the full definitions.
   assert.deepEqual(parseWorktrunkAliasNames(output), ["deploy", "land"]);
   assert.deepEqual(parseWorktrunkAliasNames("Aliases:\n  land\n"), ["land"]);
   assert.deepEqual(parseWorktrunkAliasNames("wt help without aliases"), []);
+});
+
+test("Worktrunk alias metadata exposes pipeline step names", () => {
+  const config = JSON.stringify({
+    user: {
+      config: {
+        aliases: {
+          land: [
+            { "merge-pr": "gh pr merge" },
+            { verify: "gh pr view" },
+          ],
+        },
+      },
+    },
+    project: {
+      config: {
+        aliases: {
+          land: [{ cleanup: "wt remove" }],
+          deploy: "make deploy",
+          unrelated: [{ ignore: "true" }],
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(
+    parseWorktrunkAliasMetadata(["land", "deploy", "missing"], config),
+    [
+      { name: "land", steps: ["merge-pr", "verify", "cleanup"] },
+      { name: "deploy", steps: [] },
+      { name: "missing", steps: [] },
+    ],
+  );
+  assert.deepEqual(parseWorktrunkAliasMetadata(["land"], "not json"), [
+    { name: "land", steps: [] },
+  ]);
 });
 
 test("alias arguments preserve quoting and escaping", () => {
@@ -1043,12 +1080,15 @@ test("extension lazily discovers a worktree from stored repository identity", as
   }
 });
 
-test("extension exposes Worktrunk aliases under /wt", async () => {
+test("extension exposes Worktrunk aliases under /wt and as an agent tool", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
   const handlers = new Map<string, (...args: any[]) => Promise<void>>();
   const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
   const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
+  const confirmations: Array<{ title: string; message: string }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
+  let confirmAlias = true;
   let helpFails = false;
 
   try {
@@ -1059,7 +1099,9 @@ test("extension exposes Worktrunk aliases under /wt", async () => {
       registerCommand(name: string, definition: any) {
         commands.set(name, definition);
       },
-      registerTool() {},
+      registerTool(definition: any) {
+        tools.set(definition.name, definition);
+      },
       appendEntry() {},
       async exec(program: string, args: string[], options?: { cwd?: string }) {
         calls.push({ program, args: [...args], cwd: options?.cwd });
@@ -1077,8 +1119,31 @@ test("extension exposes Worktrunk aliases under /wt", async () => {
                 killed: false,
               };
         }
+        if (args[0] === "config" && args.includes("--format=json")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              user: {
+                config: {
+                  aliases: {
+                    land: [
+                      { "merge-pr": "gh pr merge" },
+                      { verify: "gh pr view" },
+                      { "sync-main": "git fetch" },
+                      { cleanup: "wt remove" },
+                    ],
+                  },
+                },
+              },
+            }),
+            stderr: "",
+            killed: false,
+          };
+        }
         if (args[0] === "land") {
-          await rm(root, { recursive: true, force: true });
+          if (args.includes("--remove-cwd") || args.length === 4) {
+            await rm(root, { recursive: true, force: true });
+          }
           return {
             code: 0,
             stdout: "Merged pull request 42",
@@ -1092,16 +1157,115 @@ test("extension exposes Worktrunk aliases under /wt", async () => {
 
     const sessionContext = {
       cwd: root,
+      signal: undefined,
       sessionManager: { getEntries: () => [] },
     };
     await handlers.get("session_start")?.({}, sessionContext);
 
     assert.deepEqual([...commands.keys()], ["wt"]);
+    assert.deepEqual([...tools.keys()], ["worktree", "worktree_alias"]);
     const command = commands.get("wt");
     assert.deepEqual(command.getArgumentCompletions("la"), [
       { value: "land", label: "land" },
     ]);
     assert.deepEqual(command.getArgumentCompletions("wo"), []);
+
+    const aliasTool = tools.get("worktree_alias");
+    assert.doesNotMatch(aliasTool.description, /merge-pr/);
+    assert.match(
+      aliasTool.parameters.properties.alias.description,
+      /land: merge-pr -> verify -> sync-main -> cleanup/,
+    );
+    assert.deepEqual(aliasTool.parameters.properties.alias.enum, ["land"]);
+
+    const aliasContext = {
+      cwd: root,
+      hasUI: true,
+      ui: {
+        async confirm(title: string, message: string) {
+          confirmations.push({ title, message });
+          return confirmAlias;
+        },
+      },
+    };
+    await assert.rejects(
+      aliasTool.execute(
+        "call-no-ui",
+        { alias: "land", args: [] },
+        new AbortController().signal,
+        undefined,
+        { cwd: root, hasUI: false },
+      ),
+      /requires interactive or RPC mode/,
+    );
+    await assert.rejects(
+      aliasTool.execute(
+        "call-unknown",
+        { alias: "deploy", args: [] },
+        new AbortController().signal,
+        undefined,
+        aliasContext,
+      ),
+      /Worktrunk alias not available: deploy/,
+    );
+
+    confirmAlias = false;
+    const callsBeforeCancellation = calls.length;
+    const cancelled = await aliasTool.execute(
+      "call-cancelled",
+      { alias: "land", args: ["42"] },
+      new AbortController().signal,
+      undefined,
+      aliasContext,
+    );
+    assert.equal(calls.length, callsBeforeCancellation);
+    assert.equal(cancelled.content[0].text, "Cancelled Worktrunk alias land.");
+    assert.deepEqual(cancelled.details, {
+      alias: "land",
+      args: ["42"],
+      cancelled: true,
+      truncated: false,
+    });
+
+    confirmAlias = true;
+    const toolResult = await aliasTool.execute(
+      "call-land",
+      { alias: "land", args: ["42"] },
+      new AbortController().signal,
+      undefined,
+      aliasContext,
+    );
+    assert.deepEqual(calls.at(-1), {
+      program: "wt",
+      args: ["land", "42"],
+      cwd: root,
+    });
+    assert.match(confirmations.at(-1)?.message ?? "", /Command: .*land.*42/);
+    assert.match(
+      confirmations.at(-1)?.message ?? "",
+      /Pipeline: merge-pr -> verify -> sync-main -> cleanup/,
+    );
+    assert.match(toolResult.content[0].text, /Merged pull request 42/);
+    assert.deepEqual(toolResult.details, {
+      alias: "land",
+      args: ["42"],
+      truncated: false,
+    });
+
+    const removedCwd = await aliasTool.execute(
+      "call-remove-cwd",
+      { alias: "land", args: ["--remove-cwd"] },
+      new AbortController().signal,
+      undefined,
+      aliasContext,
+    );
+    assert.match(removedCwd.content[0].text, /removed Pi's working directory/);
+    assert.deepEqual(removedCwd.details, {
+      alias: "land",
+      args: ["--remove-cwd"],
+      truncated: false,
+    });
+    await mkdir(root);
 
     helpFails = true;
     await handlers.get("session_start")?.({}, sessionContext);
