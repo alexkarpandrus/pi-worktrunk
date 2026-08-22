@@ -17,6 +17,8 @@ import extension, {
   handleWorktreeCommand,
   markerArgs,
   materializeSessionSnapshot,
+  parseAliasArguments,
+  parseWorktrunkAliasNames,
 } from "./worktrunk.ts";
 
 const worktreeList = JSON.stringify({
@@ -69,6 +71,35 @@ const worktreeList = JSON.stringify({
       },
     },
   ],
+});
+
+test("Worktrunk aliases are parsed from help output", () => {
+  const output = `wt - Git worktree management
+
+Aliases:
+  deploy, land, deploy
+
+Run wt config alias show for the full definitions.
+`;
+
+  assert.deepEqual(parseWorktrunkAliasNames(output), ["deploy", "land"]);
+  assert.deepEqual(parseWorktrunkAliasNames("Aliases:\n  land\n"), ["land"]);
+  assert.deepEqual(parseWorktrunkAliasNames("wt help without aliases"), []);
+});
+
+test("alias arguments preserve quoting and escaping", () => {
+  assert.deepEqual(
+    parseAliasArguments(`42 "two words" '' escaped\\ value`),
+    ["42", "two words", "", "escaped value"],
+  );
+  assert.throws(
+    () => parseAliasArguments(`"unterminated`),
+    /unterminated quote/,
+  );
+  assert.throws(
+    () => parseAliasArguments("trailing\\"),
+    /trailing escape character/,
+  );
 });
 
 test("marker arguments map pi states to Worktrunk", () => {
@@ -809,11 +840,11 @@ test("worktree tool renders native output for every action", async () => {
       )
       .render(120)[0]
       .trimEnd(),
-    "<toolTitle><bold>Worktrunk</bold></toolTitle> › create <accent>feature/new</accent>",
+    "<toolTitle><bold>Worktrunk</bold></toolTitle> › <bold>create</bold> <accent>feature/new</accent>",
   );
   assert.equal(
     tool.renderCall({ action: "list" }, theme).render(120)[0].trimEnd(),
-    "<toolTitle><bold>Worktrunk</bold></toolTitle> › list",
+    "<toolTitle><bold>Worktrunk</bold></toolTitle> › <bold>list</bold>",
   );
 
   const list = await execute({ action: "list" });
@@ -1007,6 +1038,111 @@ test("extension lazily discovers a worktree from stored repository identity", as
 
     assert.equal(calls.at(-1)?.program, "wt");
     assert.equal(calls.at(-1)?.cwd, main);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("extension exposes Worktrunk aliases under /worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  const commands = new Map<string, any>();
+  const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
+  const notifications: Array<{ message: string; level: string }> = [];
+  let helpFails = false;
+
+  try {
+    extension({
+      on(event: string, handler: (...args: any[]) => Promise<void>) {
+        handlers.set(event, handler);
+      },
+      registerCommand(name: string, definition: any) {
+        commands.set(name, definition);
+      },
+      registerTool() {},
+      appendEntry() {},
+      async exec(program: string, args: string[], options?: { cwd?: string }) {
+        calls.push({ program, args: [...args], cwd: options?.cwd });
+        if (program === "git") {
+          return { code: 1, stdout: "", stderr: "", killed: false };
+        }
+        if (args.length === 1 && args[0] === "--help") {
+          return helpFails
+            ? { code: 1, stdout: "", stderr: "failed", killed: false }
+            : {
+                code: 0,
+                stdout:
+                  "Commands:\n  list\n\nAliases:\n  land, list, worktree\n\nOptions:\n",
+                stderr: "",
+                killed: false,
+              };
+        }
+        if (args[0] === "land") {
+          await rm(root, { recursive: true, force: true });
+          return {
+            code: 0,
+            stdout: "Merged pull request 42",
+            stderr: "✓ Removed feature worktree",
+            killed: false,
+          };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    const sessionContext = {
+      cwd: root,
+      sessionManager: { getEntries: () => [] },
+    };
+    await handlers.get("session_start")?.({}, sessionContext);
+
+    assert.deepEqual([...commands.keys()], ["worktree"]);
+    const command = commands.get("worktree");
+    assert.deepEqual(command.getArgumentCompletions("la"), [
+      { value: "land", label: "land" },
+    ]);
+    assert.deepEqual(command.getArgumentCompletions("wo"), []);
+
+    helpFails = true;
+    await handlers.get("session_start")?.({}, sessionContext);
+    assert.deepEqual(command.getArgumentCompletions("la"), []);
+
+    helpFails = false;
+    await handlers.get("session_start")?.({}, sessionContext);
+    assert.deepEqual(command.getArgumentCompletions("la"), [
+      { value: "land", label: "land" },
+    ]);
+    assert.deepEqual(command.getArgumentCompletions("li"), [
+      { value: "list", label: "list" },
+    ]);
+
+    const commandContext = {
+      cwd: root,
+      signal: undefined,
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+      },
+    };
+    await command.handler("", commandContext);
+    await command.handler(`land 42 "two words" ''`, commandContext);
+
+    assert.deepEqual(calls.at(-1), {
+      program: "wt",
+      args: ["land", "42", "two words", ""],
+      cwd: root,
+    });
+    assert.equal(notifications[0]?.level, "info");
+    assert.match(notifications[0]?.message ?? "", /\/worktree land \[args\]/);
+    assert.deepEqual(notifications[1], {
+      message:
+        "Merged pull request 42\n✓ Removed feature worktree\n\n" +
+        "The alias removed Pi's working directory. Use " +
+        "`/worktree continue <target>` to continue this session in an " +
+        "existing worktree.",
+      level: "info",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

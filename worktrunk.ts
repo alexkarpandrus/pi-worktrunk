@@ -647,6 +647,22 @@ const SUBCOMMANDS = [
   "help",
 ] as const;
 
+const RESERVED_SUBCOMMANDS = new Set<string>([
+  ...SUBCOMMANDS,
+  "ls",
+  "rm",
+  "config",
+  "worktree",
+]);
+
+function helpText(aliases: readonly string[]): string {
+  if (aliases.length === 0) return HELP_TEXT;
+  return (
+    `${HELP_TEXT}\n\nWorktrunk aliases:\n` +
+    aliases.map((alias) => `  /worktree ${alias} [args]`).join("\n")
+  );
+}
+
 function splitCommand(input: string): { command: string; args: string } {
   const trimmed = input.trim();
   if (!trimmed) return { command: "help", args: "" };
@@ -657,6 +673,85 @@ function splitCommand(input: string): { command: string; args: string } {
         command: trimmed.slice(0, separator),
         args: trimmed.slice(separator).trim(),
       };
+}
+
+const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+export function parseWorktrunkAliasNames(output: string): string[] {
+  const aliases: string[] = [];
+  let inAliases = false;
+
+  for (const line of output.split("\n")) {
+    if (!inAliases) {
+      if (line.trim() === "Aliases:") inAliases = true;
+      continue;
+    }
+    if (!line.trim()) break;
+    if (!/^\s/.test(line)) break;
+
+    for (const value of line.split(",")) {
+      const name = value.trim();
+      if (WORKTRUNK_ALIAS_NAME.test(name) && !aliases.includes(name)) {
+        aliases.push(name);
+      }
+    }
+  }
+
+  return aliases;
+}
+
+export function parseAliasArguments(input: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let started = false;
+  let escaping = false;
+
+  for (const character of input) {
+    if (escaping) {
+      current += character;
+      started = true;
+      escaping = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaping = true;
+      started = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = undefined;
+      else current += character;
+      started = true;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      if (started) {
+        args.push(current);
+        current = "";
+        started = false;
+      }
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+
+  if (escaping) {
+    throw new WorktrunkError(
+      "Invalid alias arguments: trailing escape character.",
+    );
+  }
+  if (quote) {
+    throw new WorktrunkError("Invalid alias arguments: unterminated quote.");
+  }
+  if (started) args.push(current);
+  return args;
 }
 
 function requireNoArgs(args: string, usage: string): void {
@@ -896,6 +991,7 @@ export async function handleWorktreeCommand(
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
   continueSession: ContinueSession = continueSessionInWorktree,
+  aliases: readonly string[] = [],
 ): Promise<void> {
   const { command: rawCommand, args } = splitCommand(input);
   const command =
@@ -910,7 +1006,7 @@ export async function handleWorktreeCommand(
   try {
     switch (command) {
       case "help":
-        ctx.ui.notify(HELP_TEXT, "info");
+        ctx.ui.notify(helpText(aliases), "info");
         return;
       case "list":
         await commandList(args, ctx, client);
@@ -935,7 +1031,7 @@ export async function handleWorktreeCommand(
         return;
       default:
         ctx.ui.notify(
-          `Unknown worktree command: ${rawCommand}\n\n${HELP_TEXT}`,
+          `Unknown worktree command: ${rawCommand}\n\n${helpText(aliases)}`,
           "error",
         );
     }
@@ -948,7 +1044,7 @@ export async function handleWorktreeCommand(
 }
 
 async function formatToolOutput(
-  action: WorktreeAction,
+  action: string,
   output: string,
   suffix?: string,
 ) {
@@ -973,6 +1069,57 @@ async function formatToolOutput(
     truncated: true as const,
     fullOutputPath,
   };
+}
+
+async function handleWorktrunkAliasCommand(
+  alias: string,
+  input: string,
+  ctx: ExtensionCommandContext,
+  runWt: RunWt,
+): Promise<void> {
+  try {
+    const args = parseAliasArguments(input);
+    let result: WtResult;
+    try {
+      result = await runWt([alias, ...args], {
+        cwd: ctx.cwd,
+        signal: ctx.signal,
+      });
+    } catch (error) {
+      throw new WorktrunkError(
+        !existsSync(ctx.cwd)
+          ? missingCwdMessage(ctx.cwd)
+          : `Could not execute Worktrunk: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+      );
+    }
+    if (result.code !== 0 || result.killed) {
+      throw new WorktrunkError(
+        formatWtFailure([alias, ...args], result, ctx.cwd),
+      );
+    }
+
+    const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()]
+      .filter(Boolean)
+      .join("\n");
+    const rendered = await formatToolOutput(
+      `alias-${alias}`,
+      output || `wt ${alias} completed.`,
+    );
+    const recoveryHint = existsSync(ctx.cwd)
+      ? ""
+      :
+        "\n\nThe alias removed Pi's working directory. Use " +
+        "`/worktree continue <target>` to continue this session in an " +
+        "existing worktree.";
+    ctx.ui.notify(rendered.text + recoveryHint, "info");
+  } catch (error) {
+    ctx.ui.notify(
+      error instanceof Error ? error.message : String(error),
+      "error",
+    );
+  }
 }
 
 async function toolResult(
@@ -1162,6 +1309,25 @@ export default function (pi: ExtensionAPI) {
   };
   const tracker = createMarkerUpdater(execWt);
   const client = createWorktrunkClient(runWt);
+  const worktrunkAliases = new Set<string>();
+
+  async function discoverAliases(ctx: ExtensionContext) {
+    worktrunkAliases.clear();
+    let result: WtResult;
+    try {
+      result = await runWt(["--help"], {
+        cwd: ctx.cwd,
+        cwdMode: "repository-read",
+      });
+    } catch {
+      return;
+    }
+    if (result.code !== 0) return;
+
+    for (const alias of parseWorktrunkAliasNames(result.stdout ?? "")) {
+      if (!RESERVED_SUBCOMMANDS.has(alias)) worktrunkAliases.add(alias);
+    }
+  }
 
   async function restoreRepositoryIdentity(ctx: ExtensionContext) {
     const stored = [...ctx.sessionManager.getEntries()]
@@ -1216,11 +1382,23 @@ export default function (pi: ExtensionAPI) {
     getArgumentCompletions(argumentPrefix) {
       const prefix = argumentPrefix.trimStart();
       if (/\s/.test(prefix)) return null;
-      return SUBCOMMANDS.filter((command) => command.startsWith(prefix)).map(
-        (command) => ({ value: command, label: command }),
+      return [...SUBCOMMANDS, ...worktrunkAliases]
+        .filter((command) => command.startsWith(prefix))
+        .map((command) => ({ value: command, label: command }));
+    },
+    handler: (input, ctx) => {
+      const { command, args } = splitCommand(input);
+      if (worktrunkAliases.has(command)) {
+        return handleWorktrunkAliasCommand(command, args, ctx, runWt);
+      }
+      return handleWorktreeCommand(
+        input,
+        ctx,
+        client,
+        continueSessionInWorktree,
+        [...worktrunkAliases],
       );
     },
-    handler: (args, ctx) => handleWorktreeCommand(args, ctx, client),
   });
 
   pi.registerTool({
@@ -1355,7 +1533,7 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       let text =
         theme.fg("toolTitle", theme.bold("Worktrunk")) +
-        ` › ${args.action}`;
+        ` › ${theme.bold(args.action)}`;
       const operand = args.branch ?? args.target;
       if (operand) text += ` ${theme.fg("accent", operand)}`;
       return new Text(text, 0, 0);
@@ -1371,6 +1549,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await restoreRepositoryIdentity(ctx);
+    await discoverAliases(ctx);
     await tracker.markWaiting(ctx.cwd);
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
