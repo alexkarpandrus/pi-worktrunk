@@ -88,12 +88,6 @@ there.
   bypass Worktrunk approval settings.
 - Session movement preserves the source session.
 
-## 🧹 Uninstall
-
-```sh
-pi remove npm:pi-worktrunk
-```
-
 ## 📄 License
 
 [MIT](LICENSE)
