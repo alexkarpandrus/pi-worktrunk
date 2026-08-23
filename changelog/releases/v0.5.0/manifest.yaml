@@ -1,0 +1,10 @@
+created: 2026-08-23
+title: Automatic Worktrunk session placement
+intro: >-
+  Pi now follows Worktrunk session destinations automatically, so switch, create,
+  and alias commands continue work in the correct worktree without extra placement
+  flags. This release also keeps session recovery and approval safeguards intact across
+  transitions.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.4.0
