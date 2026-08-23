@@ -1,42 +1,20 @@
-import { existsSync, statSync, writeFileSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, resolve, sep } from "node:path";
 
 import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
   SessionManager,
-  formatSize,
-  truncateHead,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
   type SessionEntry,
   type SessionHeader,
 } from "@earendil-works/pi-coding-agent";
-import {
-  Text,
-  truncateToWidth,
-  type Component,
-} from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-export const MARKERS = {
-  working: "🤖",
-  waiting: "💬",
-} as const;
-
-const WORKTREE_ACTIONS = [
-  "list",
-  "status",
-  "create",
-  "remove",
-  "path",
-  "settings",
-] as const;
-
-type WorktreeAction = (typeof WORKTREE_ACTIONS)[number];
+export const MARKERS = { working: "🤖", waiting: "💬" } as const;
 
 type WtResult = {
   stdout?: string;
@@ -45,120 +23,70 @@ type WtResult = {
   killed?: boolean;
   relocated?: boolean;
 };
-
 type RunWtOptions = {
   cwd?: string;
   signal?: AbortSignal;
   cwdMode?: "repository-read";
 };
-
 type RunWt = (args: string[], options?: RunWtOptions) => Promise<WtResult>;
 
-type SessionTarget = {
-  branch: string | null;
-  path: string;
-};
-
-export type SessionSnapshot = {
-  header: SessionHeader;
-  entries: SessionEntry[];
-};
-
-type SessionFork = {
-  destinationSession: string;
-};
-
-type ForkSession = (
-  sourceSession: string,
-  targetCwd: string,
-  snapshot: SessionSnapshot | undefined,
-  targetSessionDir: string | undefined,
-) => string | SessionFork;
-
-type ContinueSession = (
-  ctx: ExtensionCommandContext,
-  target: SessionTarget,
-) => Promise<boolean>;
-
-type Relation = {
-  ahead?: number;
-  behind?: number;
-};
-
+export type SessionSnapshot = { header: SessionHeader; entries: SessionEntry[] };
+type Relation = { ahead?: number; behind?: number };
 type WorktreeItem = {
   branch: string | null;
-  head?: {
-    short_sha?: string;
-    subject?: string;
-  };
+  head?: { short_sha?: string; subject?: string };
   worktree?: {
     path?: string;
     main?: boolean;
     current?: boolean;
-    previous?: boolean;
-    changes?: {
-      staged?: boolean;
-      modified?: boolean;
-      untracked?: boolean;
-      renamed?: boolean;
-      deleted?: boolean;
-      conflicted?: boolean;
-    };
+    changes?: Record<string, boolean | undefined>;
   };
   default_branch?: Relation;
   upstream?: Relation;
-  display?: {
-    state?: string;
-    symbols?: string;
-    statusline?: string;
-  };
+  display?: { state?: string; symbols?: string; statusline?: string };
 };
-
-type WorktreeList = {
-  schema: number;
-  items: WorktreeItem[];
+type WorktreeList = { schema: number; items: WorktreeItem[] };
+export type WorktrunkAlias = { name: string; steps: string[] };
+type SessionLocation = { branch: string | null; path: string; commonDir?: string };
+type SessionTransitionKind = "move" | "recovery";
+type SessionTransitionDetails = {
+  kind: SessionTransitionKind;
+  source: SessionLocation;
+  target: SessionLocation;
+  trail: SessionLocation[];
+  sourceSession: string;
+  destinationSession: string;
 };
-
-type BranchOutcome =
-  | "deleted"
-  | "deferred"
-  | "not_attempted"
-  | "retained_unmerged"
-  | "retained_checked_out"
-  | "retained_raced"
-  | "retained_failed";
-
-type RemovalOutcome = {
-  kind?: "worktree" | "branch";
-  branch: string | null;
-  path?: string;
-  pruned?: boolean;
-  branch_outcome?: BranchOutcome;
-  branch_checked_out_at?: string | null;
-  branch_deleted?: boolean;
-};
-
-type ToolOutputDetails = {
-  action: WorktreeAction;
-  truncated: boolean;
-  fullOutputPath?: string;
-  display?: string;
-  displayTruncated?: boolean;
-  displayFullOutputPath?: string;
-};
-
-export type WorktrunkAlias = {
-  name: string;
-  steps: string[];
-};
-
-type AliasToolOutputDetails = {
-  alias: string;
+type RepositoryIdentity = { commonDir: string; device: number; inode: number };
+type Invocation = {
   args: string[];
-  cancelled?: boolean;
-  truncated: boolean;
-  fullOutputPath?: string;
+  command?: string;
+  commandIndex?: number;
+  commandArgs: string[];
 };
+type Execution = {
+  result: WtResult;
+  output: string;
+  moved: boolean;
+  canContinue: boolean;
+};
+type PendingContinuation = { key: string; nonce: string; expiresAt: number };
+
+const SESSION_TRANSITION_MESSAGE = "pi-worktrunk";
+const LEGACY_SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
+const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
+const MAX_CONTINUATION_OUTPUT = 50_000;
+const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
+const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
+const SUBCOMMANDS = ["switch", "list", "remove", "merge", "step", "hook", "config"] as const;
+const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+class WorktrunkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktrunkError";
+  }
+}
 
 export function markerArgs(marker?: string): string[] {
   return marker === undefined
@@ -168,18 +96,14 @@ export function markerArgs(marker?: string): string[] {
 
 export function createMarkerUpdater(runWt: RunWt) {
   let enabled = true;
-
   async function update(marker?: string, cwd?: string): Promise<void> {
-    if (!enabled) return;
-
+    if (!enabled || (cwd !== undefined && !existsSync(cwd))) return;
     try {
-      const result = await runWt(markerArgs(marker), { cwd });
-      if (result.code !== 0) enabled = false;
+      if ((await runWt(markerArgs(marker), { cwd })).code !== 0) enabled = false;
     } catch {
       enabled = false;
     }
   }
-
   return {
     markWorking: (cwd?: string) => update(MARKERS.working, cwd),
     markWaiting: (cwd?: string) => update(MARKERS.waiting, cwd),
@@ -187,575 +111,147 @@ export function createMarkerUpdater(runWt: RunWt) {
   };
 }
 
-class WorktrunkError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "WorktrunkError";
-  }
-}
-
-function serializeSession(snapshot: SessionSnapshot): string {
-  return `${[snapshot.header, ...snapshot.entries]
-    .map((entry) => JSON.stringify(entry))
-    .join("\n")}\n`;
-}
-
 function sessionFileIsUnwritten(path: string): boolean {
   return !existsSync(path) || statSync(path).size === 0;
 }
-
-export function materializeSessionSnapshot(
-  path: string,
-  snapshot: SessionSnapshot,
-): void {
+function serializeSession(snapshot: SessionSnapshot): string {
+  return `${[snapshot.header, ...snapshot.entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+}
+export function materializeSessionSnapshot(path: string, snapshot: SessionSnapshot): void {
   if (!sessionFileIsUnwritten(path)) return;
   writeFileSync(path, serializeSession(snapshot), {
     encoding: "utf8",
     flag: existsSync(path) ? "w" : "wx",
   });
 }
-
+function targetSessionDirectory(manager: ExtensionCommandContext["sessionManager"]): string | undefined {
+  const full = manager as typeof manager & { usesDefaultSessionDir?: () => boolean };
+  return full.usesDefaultSessionDir?.() ? undefined : manager.getSessionDir();
+}
 export function forkSessionFromSnapshot(
   sourceSession: string,
   targetCwd: string,
   snapshot?: SessionSnapshot,
   targetSessionDir?: string,
-): SessionFork {
+): { destinationSession: string } {
   if (sessionFileIsUnwritten(sourceSession)) {
-    if (!snapshot) {
-      throw new Error("Cannot continue an unwritten session without a snapshot.");
-    }
+    if (!snapshot) throw new Error("Cannot copy an unwritten session without a snapshot.");
     materializeSessionSnapshot(sourceSession, snapshot);
   }
-
-  const session = SessionManager.forkFrom(
-    sourceSession,
-    targetCwd,
-    targetSessionDir,
-  );
-  const destinationSession = session.getSessionFile();
-  if (!destinationSession) {
-    throw new Error("Pi did not create a persisted session copy.");
-  }
+  const manager = SessionManager.forkFrom(sourceSession, targetCwd, targetSessionDir);
+  const destinationSession = manager.getSessionFile();
+  if (!destinationSession) throw new Error("Pi did not create a persisted session copy.");
   return { destinationSession };
 }
-
-export function createSessionContinuator(forkSession: ForkSession) {
-  return async function continueSession(
-    ctx: ExtensionCommandContext,
-    target: SessionTarget,
-  ): Promise<boolean> {
-    const sourceCwd = resolve(ctx.cwd);
-    const targetCwd = resolve(ctx.cwd, target.path);
-    if (sourceCwd === targetCwd) {
-      throw new WorktrunkError(
-        "Pi is already running in the selected worktree.",
-      );
-    }
-    if (!ctx.hasUI) {
-      throw new WorktrunkError(
-        "Continuing a session in another worktree requires interactive or RPC mode.",
-      );
-    }
-
-    const sourceSession = ctx.sessionManager.getSessionFile();
-    if (!sourceSession) {
-      throw new WorktrunkError(
-        "Cannot continue an ephemeral session with no session file.",
-      );
-    }
-
-    await ctx.waitForIdle();
-    const confirmed = await ctx.ui.confirm(
-      `↪ Continue in ${target.branch ?? "selected worktree"}?`,
-      [
-        `From  ${sourceCwd}`,
-        `To    ${targetCwd}`,
-        "",
-        "Creates a session copy; the original stays available.",
-      ].join("\n"),
-    );
-    if (!confirmed) {
-      ctx.ui.notify(
-        `Session continuation cancelled.\nWorktree: ${targetCwd}\nPi remains in ${sourceCwd}.`,
-        "info",
-      );
-      return false;
-    }
-
-    let destinationSession: string;
-    try {
-      let snapshot: SessionSnapshot | undefined;
-      if (sessionFileIsUnwritten(sourceSession)) {
-        const sourceHeader = ctx.sessionManager.getHeader();
-        if (!sourceHeader) {
-          throw new Error("The source session has no header.");
-        }
-        snapshot = {
-          header: structuredClone(sourceHeader),
-          entries: structuredClone(ctx.sessionManager.getEntries()),
-        };
-      }
-      const targetSessionDir = ctx.sessionManager.usesDefaultSessionDir()
-        ? undefined
-        : ctx.sessionManager.getSessionDir();
-      const fork = forkSession(
-        sourceSession,
-        targetCwd,
-        snapshot,
-        targetSessionDir,
-      );
-      destinationSession =
-        typeof fork === "string" ? fork : fork.destinationSession;
-    } catch (error) {
-      throw new WorktrunkError(
-        `Could not create the session continuation: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-
-    const transitionMessage = [
-      `From: ${sourceCwd}`,
-      `To:   ${targetCwd}`,
-      "",
-      "Use the new worktree for subsequent file operations; earlier paths may be stale.",
-    ].join("\n");
-
-    const result = await ctx.switchSession(destinationSession, {
-      withSession: async (nextCtx) => {
-        try {
-          await nextCtx.sendMessage({
-            customType: "↪ Continued in worktree",
-            content: transitionMessage,
-            display: true,
-            details: {
-              branch: target.branch,
-              sourceCwd,
-              targetCwd,
-              sourceSession,
-              destinationSession,
-            },
-          });
-        } catch (error) {
-          nextCtx.ui.notify(
-            `The session switched, but Pi could not record the worktree transition: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-            "warning",
-          );
-        }
-        nextCtx.ui.notify(
-          `Continued the session in ${target.branch ?? targetCwd}.\nThe source session remains available.`,
-          "info",
-        );
-      },
-    });
-    if (result.cancelled) {
-      ctx.ui.notify(
-        `Session switching was cancelled.\nContinuation: ${destinationSession}\nPi remains in ${sourceCwd}.`,
-        "warning",
-      );
-      return false;
-    }
-    return true;
-  };
-}
-
-// pi-session-move demonstrated activating a target-cwd session copy with
-// ctx.switchSession(): https://github.com/ProbabilityEngineer/pi-session-move
-const continueSessionInWorktree = createSessionContinuator(
-  forkSessionFromSnapshot,
-);
 
 function parseJson<T>(output: string, command: string): T {
   try {
     return JSON.parse(output) as T;
   } catch (error) {
-    throw new WorktrunkError(
-      `Could not parse \`${command}\` output: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    throw new WorktrunkError(`Could not parse \`${command}\` output: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
-
 function parseWorktreeList(output: string): WorktreeItem[] {
   const result = parseJson<WorktreeList>(output, "wt list --format=json");
   if (result.schema !== 2 || !Array.isArray(result.items)) {
-    throw new WorktrunkError(
-      "Unexpected `wt list --format=json` output from Worktrunk 0.70 or later.",
-    );
+    throw new WorktrunkError("Unexpected `wt list --format=json` output from Worktrunk 0.70 or later.");
   }
   return result.items;
 }
-
-function resolveWorktree(
-  worktrees: WorktreeItem[],
-  ref: string,
-): WorktreeItem | undefined {
-  const byBranch = worktrees.filter((item) => item.branch === ref);
-  if (byBranch.length > 1) {
-    throw new WorktrunkError(
-      `Branch ${ref} has multiple worktrees. Use an exact path.`,
-    );
-  }
-  if (byBranch[0]) return byBranch[0];
-
-  const byPath = worktrees.find((item) => item.worktree?.path === ref);
-  if (byPath) return byPath;
-
-  const byName = worktrees.filter(
-    (item) => item.worktree?.path && basename(item.worktree.path) === ref,
-  );
-  return byName.length === 1 ? byName[0] : undefined;
+function canonicalPath(path: string): string {
+  try { return realpathSync(path); } catch { return resolve(path); }
+}
+function itemForPath(items: readonly WorktreeItem[], path: string): WorktreeItem | undefined {
+  const target = canonicalPath(path);
+  return items.find((item) => item.worktree?.path && canonicalPath(item.worktree.path) === target);
+}
+function resolveWorktree(items: readonly WorktreeItem[], ref: string): WorktreeItem | undefined {
+  const matches = items.filter((item) =>
+    item.branch === ref || item.worktree?.path === ref ||
+    (item.worktree?.path && basename(item.worktree.path) === ref));
+  const paths = new Set(matches.flatMap((item) => item.worktree?.path ? [canonicalPath(item.worktree.path)] : []));
+  return paths.size === 1 ? matches[0] : undefined;
+}
+function uniqueCreatedTarget(before: readonly WorktreeItem[], after: readonly WorktreeItem[]): WorktreeItem | undefined {
+  const previous = new Set(before.flatMap((item) => item.worktree?.path ? [canonicalPath(item.worktree.path)] : []));
+  const created = after.filter((item) => item.worktree?.path && !previous.has(canonicalPath(item.worktree.path)));
+  return created.length === 1 ? created[0] : undefined;
+}
+function worktreeLocation(item: WorktreeItem | undefined, fallback: string, commonDir?: string): SessionLocation {
+  return { branch: item?.branch ?? null, path: canonicalPath(item?.worktree?.path ?? fallback), ...(commonDir ? { commonDir } : {}) };
 }
 
 function approvalHint(output: string): string {
-  if (!/needs approval|cannot prompt for approval/i.test(output)) return "";
-  return (
-    "\nReview and approve the project commands in a terminal with " +
-    "`wt config approvals add`, then retry."
-  );
+  return /needs approval|cannot prompt for approval/i.test(output)
+    ? "\nReview and approve the project commands in a terminal with `wt config approvals add`, then retry."
+    : "";
 }
-
 function missingCwdMessage(cwd: string): string {
-  return (
-    `Pi's working directory no longer exists: ${cwd}. ` +
-    "Continue the session from an existing worktree or restart Pi there."
-  );
+  return `Pi's working directory no longer exists: ${cwd}. Continue the session from an existing worktree or restart Pi there.`;
 }
-
-function formatWtFailure(
-  args: string[],
-  result: WtResult,
-  cwd: string,
-): string {
-  const output = [result.stderr?.trim(), result.stdout?.trim()]
-    .filter(Boolean)
-    .join("\n");
-
+function formatWtFailure(args: readonly string[], result: WtResult, cwd: string): string {
+  const output = [result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join("\n");
   if (result.killed) return `wt ${args.join(" ")} was cancelled.`;
   if (!existsSync(cwd)) return missingCwdMessage(cwd);
   if (!output || result.code === 127 || /\bENOENT\b/i.test(output)) {
-    return (
-      "Could not start Worktrunk (`wt`). Install Worktrunk 0.70 or later " +
-      "and ensure it is available on `PATH`."
-    );
+    return "Could not start Worktrunk (`wt`). Install Worktrunk 0.70 or later and ensure it is available on `PATH`.";
   }
-
   return `wt ${args.join(" ")} failed: ${output}${approvalHint(output)}`;
 }
 
 export function createWorktrunkClient(runWt: RunWt) {
-  async function run(
-    args: string[],
-    cwd: string,
-    signal?: AbortSignal,
-    cwdMode?: "repository-read",
-  ): Promise<WtResult> {
-    let result: WtResult;
-    try {
-      result = await runWt(args, { cwd, signal, cwdMode });
-    } catch (error) {
-      throw new WorktrunkError(
-        !existsSync(cwd)
-          ? missingCwdMessage(cwd)
-          : `Could not execute Worktrunk: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-      );
-    }
-    if (result.code !== 0) {
-      throw new WorktrunkError(formatWtFailure(args, result, cwd));
-    }
-    return result;
-  }
-
-  async function list(cwd: string, signal?: AbortSignal) {
-    const result = await run(
-      ["--config-set", "list.json-schema=2", "list", "--format=json"],
-      cwd,
-      signal,
-      "repository-read",
-    );
-    const worktrees = parseWorktreeList(result.stdout ?? "");
-    if (result.relocated) {
-      for (const item of worktrees) {
-        if (item.worktree) item.worktree.current = false;
-      }
-    }
-    return worktrees;
-  }
-
   return {
-    list,
-
-    async status(cwd: string, signal?: AbortSignal) {
-      return (await list(cwd, signal)).find(
-        (item) => item.worktree?.current === true,
+    async list(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
+      const result = await runWt(
+        ["--config-set", "list.json-schema=2", "list", "--format=json"],
+        { cwd, signal, cwdMode: "repository-read" },
       );
+      if (result.code !== 0) throw new WorktrunkError(formatWtFailure(["list"], result, cwd));
+      const items = parseWorktreeList(result.stdout ?? "");
+      if (result.relocated) for (const item of items) if (item.worktree) item.worktree.current = false;
+      return items;
     },
-
-    async listText(cwd: string, signal?: AbortSignal) {
-      const result = await run(
-        ["list"],
-        cwd,
-        signal,
-        "repository-read",
-      );
-      const table = result.stdout?.trimEnd() ?? "";
-      const summary = result.stderr?.trim() ?? "";
-      return [table, summary].filter(Boolean).join("\n\n");
-    },
-
-    async create(cwd: string, branch: string, signal?: AbortSignal) {
-      const result = await run(
-        ["switch", "--create", "--no-cd", "--format=json", branch],
-        cwd,
-        signal,
-      );
-      const created = parseJson<{
-        branch?: string;
-        path?: string;
-        created_branch?: boolean;
-        base_branch?: string;
-      }>(result.stdout ?? "", "wt switch --format=json");
-      if (!created.path) {
-        throw new WorktrunkError(
-          `Worktrunk created ${branch}, but did not report its path.`,
-        );
-      }
-      const display = result.stderr?.trimEnd();
-      return {
-        branch: created.branch ?? branch,
-        path: created.path,
-        ...(created.created_branch !== undefined
-          ? { createdBranch: created.created_branch }
-          : {}),
-        ...(created.base_branch ? { baseBranch: created.base_branch } : {}),
-        ...(display ? { display } : {}),
-      };
-    },
-
-    async remove(cwd: string, ref: string, signal?: AbortSignal) {
-      const result = await run(
-        ["remove", "--foreground", "--format=json", ref],
-        cwd,
-        signal,
-      );
-      return {
-        outcomes: parseJson<RemovalOutcome[]>(
-          result.stdout ?? "",
-          "wt remove --format=json",
-        ),
-        display: result.stderr?.trimEnd() || undefined,
-      };
-    },
-
-    async settings(cwd: string, signal?: AbortSignal) {
-      const result = await run(
-        ["config", "show", "--format=json"],
-        cwd,
-        signal,
-        "repository-read",
-      );
+    async settings(cwd: string, signal?: AbortSignal): Promise<string> {
+      const result = await runWt(["config", "show", "--format=json"], { cwd, signal, cwdMode: "repository-read" });
+      if (result.code !== 0) throw new WorktrunkError(formatWtFailure(["config", "show", "--format=json"], result, cwd));
       return result.stdout?.trim() ?? "";
-    },
-
-    async settingsText(cwd: string, signal?: AbortSignal) {
-      const result = await run(
-        ["config", "show"],
-        cwd,
-        signal,
-        "repository-read",
-      );
-      return result.stdout?.trimEnd() ?? "";
     },
   };
 }
 
-export type WorktrunkClient = ReturnType<typeof createWorktrunkClient>;
-
-function relationText(relation?: Relation): string {
-  return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`;
-}
-
-function changeText(item: WorktreeItem): string {
-  const changes = item.worktree?.changes;
-  const active = [
-    changes?.staged ? "staged" : undefined,
-    changes?.modified ? "modified" : undefined,
-    changes?.untracked ? "untracked" : undefined,
-    changes?.renamed ? "renamed" : undefined,
-    changes?.deleted ? "deleted" : undefined,
-    changes?.conflicted ? "conflicted" : undefined,
-  ].filter(Boolean);
-  return active.length > 0 ? active.join(", ") : "clean";
-}
-
-function formatWorktree(item: WorktreeItem): string {
-  const labels = [
-    item.worktree?.current ? "current" : undefined,
-    item.worktree?.main ? "main" : undefined,
-  ].filter(Boolean);
-  const suffix = labels.length > 0 ? ` [${labels.join(", ")}]` : "";
-  const symbols = item.display?.symbols ? ` ${item.display.symbols}` : "";
-  return `${item.branch ?? "(detached)"}${suffix}${symbols}\n  ${
-    item.worktree?.path ?? "(no worktree path)"
-  }`;
-}
-
-function formatWorktreeStatus(item: WorktreeItem): string {
-  return [
-    `Branch: ${item.branch ?? "(detached)"}`,
-    `Path: ${item.worktree?.path ?? "(no worktree path)"}`,
-    `Current: ${item.worktree?.current ? "yes" : "no"}`,
-    `Primary: ${item.worktree?.main ? "yes" : "no"}`,
-    `State: ${item.display?.state ?? "normal"}`,
-    `Changes: ${changeText(item)}`,
-    `Default branch: ${relationText(item.default_branch)}`,
-    `Upstream: ${relationText(item.upstream)}`,
-    `HEAD: ${item.head?.short_sha ?? "unknown"}${
-      item.head?.subject ? ` ${item.head.subject}` : ""
-    }`,
-  ].join("\n");
-}
-
-function removableRef(item: WorktreeItem): string {
-  if (item.worktree?.main) {
-    throw new WorktrunkError("The primary worktree cannot be removed.");
-  }
-  if (item.worktree?.current) {
-    throw new WorktrunkError(
-      "The current worktree cannot be removed. Use another worktree first.",
-    );
-  }
-  const ref = item.worktree?.path ?? item.branch;
-  if (!ref) throw new WorktrunkError("The worktree has no removable reference.");
-  return ref;
-}
-
-const HELP_TEXT = `
-/wt - Manage worktrees with Worktrunk
-
-Commands:
-  /wt list                           Select and inspect a worktree
-  /wt create <branch> [--continue]   Create a worktree and optionally continue there
-  /wt continue [target]              Continue this Pi session in a worktree
-  /wt remove [target]                Remove a worktree and any safe-to-delete branch
-  /wt status                         Show the current worktree
-  /wt cd [target]                    Show a worktree path
-  /wt settings                       Show the active Worktrunk configuration
-`.trim();
-
-const SUBCOMMANDS = [
-  "list",
-  "create",
-  "continue",
-  "remove",
-  "status",
-  "cd",
-  "settings",
-  "help",
-] as const;
-
-const RESERVED_SUBCOMMANDS = new Set<string>([
-  ...SUBCOMMANDS,
-  "ls",
-  "rm",
-  "config",
-  "worktree",
-]);
-
-function helpText(aliases: readonly string[]): string {
-  if (aliases.length === 0) return HELP_TEXT;
-  return (
-    `${HELP_TEXT}\n\nWorktrunk aliases:\n` +
-    aliases.map((alias) => `  /wt ${alias} [args]`).join("\n")
-  );
-}
-
-function splitCommand(input: string): { command: string; args: string } {
-  const trimmed = input.trim();
-  if (!trimmed) return { command: "help", args: "" };
-  const separator = trimmed.search(/\s/);
-  return separator === -1
-    ? { command: trimmed, args: "" }
-    : {
-        command: trimmed.slice(0, separator),
-        args: trimmed.slice(separator).trim(),
-      };
-}
-
-const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-
 export function parseWorktrunkAliasNames(output: string): string[] {
   const aliases: string[] = [];
   let inAliases = false;
-
   for (const line of output.split("\n")) {
-    if (!inAliases) {
-      if (line.trim() === "Aliases:") inAliases = true;
-      continue;
-    }
-    if (!line.trim()) break;
-    if (!/^\s/.test(line)) break;
-
+    if (!inAliases) { if (line.trim() === "Aliases:") inAliases = true; continue; }
+    if (!line.trim() || !/^\s/.test(line)) break;
     for (const value of line.split(",")) {
       const name = value.trim();
-      if (WORKTRUNK_ALIAS_NAME.test(name) && !aliases.includes(name)) {
-        aliases.push(name);
-      }
+      if (WORKTRUNK_ALIAS_NAME.test(name) && !aliases.includes(name)) aliases.push(name);
     }
   }
-
   return aliases;
 }
-
 function aliasStepNames(value: unknown): string[] {
-  const entries = Array.isArray(value) ? value : [value];
   const steps: string[] = [];
-  for (const entry of entries) {
+  for (const entry of Array.isArray(value) ? value : [value]) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-    for (const name of Object.keys(entry)) {
-      if (WORKTRUNK_ALIAS_NAME.test(name) && !steps.includes(name)) {
-        steps.push(name);
-      }
-    }
+    for (const name of Object.keys(entry)) if (WORKTRUNK_ALIAS_NAME.test(name) && !steps.includes(name)) steps.push(name);
   }
   return steps;
 }
-
-export function parseWorktrunkAliasMetadata(
-  names: readonly string[],
-  configOutput: string,
-): WorktrunkAlias[] {
-  const aliases = new Map(
-    names.map((name) => [name, { name, steps: [] as string[] }]),
-  );
+export function parseWorktrunkAliasMetadata(names: readonly string[], output: string): WorktrunkAlias[] {
+  const aliases = new Map(names.map((name) => [name, { name, steps: [] as string[] }]));
   let config: unknown;
-  try {
-    config = JSON.parse(configOutput);
-  } catch {
-    return [...aliases.values()];
-  }
+  try { config = JSON.parse(output); } catch { return [...aliases.values()]; }
   if (!config || typeof config !== "object") return [...aliases.values()];
-
   for (const source of ["user", "project"] as const) {
-    const layer = (config as Record<string, unknown>)[source];
+    const layer = (config as Record<string, any>)[source]?.config?.aliases;
     if (!layer || typeof layer !== "object") continue;
-    const layerConfig = (layer as Record<string, unknown>).config;
-    if (!layerConfig || typeof layerConfig !== "object") continue;
-    const configuredAliases = (layerConfig as Record<string, unknown>).aliases;
-    if (!configuredAliases || typeof configuredAliases !== "object") continue;
-
-    for (const [name, value] of Object.entries(configuredAliases)) {
+    for (const [name, value] of Object.entries(layer)) {
       const alias = aliases.get(name);
       if (!alias) continue;
-      for (const step of aliasStepNames(value)) {
-        if (!alias.steps.includes(step)) alias.steps.push(step);
-      }
+      for (const step of aliasStepNames(value)) if (!alias.steps.includes(step)) alias.steps.push(step);
     }
   }
   return [...aliases.values()];
@@ -767,1015 +263,528 @@ export function parseAliasArguments(input: string): string[] {
   let quote: "'" | '"' | undefined;
   let started = false;
   let escaping = false;
-
   for (const character of input) {
-    if (escaping) {
-      current += character;
-      started = true;
-      escaping = false;
-      continue;
-    }
-    if (character === "\\" && quote !== "'") {
-      escaping = true;
-      started = true;
-      continue;
-    }
-    if (quote) {
-      if (character === quote) quote = undefined;
-      else current += character;
-      started = true;
-      continue;
-    }
-    if (character === "'" || character === '"') {
-      quote = character;
-      started = true;
-      continue;
-    }
+    if (escaping) { current += character; started = true; escaping = false; continue; }
+    if (character === "\\" && quote !== "'") { escaping = true; started = true; continue; }
+    if (quote) { if (character === quote) quote = undefined; else current += character; started = true; continue; }
+    if (character === "'" || character === '"') { quote = character; started = true; continue; }
     if (/\s/.test(character)) {
-      if (started) {
-        args.push(current);
-        current = "";
-        started = false;
-      }
+      if (started) { args.push(current); current = ""; started = false; }
       continue;
     }
-    current += character;
-    started = true;
+    current += character; started = true;
   }
-
-  if (escaping) {
-    throw new WorktrunkError(
-      "Invalid alias arguments: trailing escape character.",
-    );
-  }
-  if (quote) {
-    throw new WorktrunkError("Invalid alias arguments: unterminated quote.");
-  }
+  if (escaping) throw new WorktrunkError("Invalid arguments: trailing escape character.");
+  if (quote) throw new WorktrunkError("Invalid arguments: unterminated quote.");
   if (started) args.push(current);
   return args;
 }
+const GLOBAL_OPTIONS_WITH_VALUES = new Set(["-C", "--config", "--config-set"]);
 
-function requireNoArgs(args: string, usage: string): void {
-  if (args) throw new WorktrunkError(`Usage: ${usage}`);
-}
-
-function requireBranch(args: string): string {
-  if (!args || /\s/.test(args) || args.startsWith("-")) {
-    throw new WorktrunkError("Usage: /wt create <branch>");
+export function parseWtInvocation(input: string): Invocation {
+  const args = parseAliasArguments(input);
+  let commandIndex: number | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (GLOBAL_OPTIONS_WITH_VALUES.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (
+      (value.startsWith("-C") && value !== "-C") ||
+      value.startsWith("--config=") ||
+      value.startsWith("--config-set=") ||
+      value.startsWith("-")
+    ) {
+      continue;
+    }
+    commandIndex = index;
+    break;
   }
-  return args;
+  return {
+    args,
+    command: commandIndex === undefined ? undefined : args[commandIndex],
+    ...(commandIndex === undefined ? {} : { commandIndex }),
+    commandArgs: commandIndex === undefined ? [] : args.slice(commandIndex + 1),
+  };
 }
-
-function parseCreateArgs(args: string): {
-  branch: string;
-  continueSession: boolean;
-} {
-  const values = args.trim().split(/\s+/).filter(Boolean);
-  const continueFlags = values.filter((value) => value === "--continue");
-  const positional = values.filter((value) => value !== "--continue");
-  if (
-    continueFlags.length > 1 ||
-    positional.length !== 1 ||
-    positional[0].startsWith("-")
-  ) {
-    throw new WorktrunkError(
-      "Usage: /wt create <branch> [--continue]",
-    );
+function quoteArgument(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+function isBareCommand(invocation: Invocation, command: string): boolean {
+  return invocation.command === command && invocation.commandArgs.length === 0;
+}
+function exactSwitchTarget(invocation: Invocation): string | undefined {
+  if (invocation.command !== "switch" || invocation.commandArgs.length !== 1) return undefined;
+  const value = invocation.commandArgs[0];
+  return value.startsWith("-") ? undefined : value;
+}
+function sensitiveGlobalOption(args: readonly string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === "--") break;
+    if (
+      value === "-C" || value.startsWith("-C") ||
+      value === "--config" || value.startsWith("--config=") ||
+      value === "--config-set" || value.startsWith("--config-set=") ||
+      value === "-y" || value === "--yes"
+    ) return value;
   }
-  return { branch: positional[0], continueSession: continueFlags.length === 1 };
+  return undefined;
 }
 
-async function chooseWorktree(
-  ctx: ExtensionCommandContext,
-  title: string,
-  worktrees: WorktreeItem[],
-): Promise<WorktreeItem | undefined> {
-  if (worktrees.length === 0) return undefined;
-  const options = worktrees.map(formatWorktree);
+function relationText(relation?: Relation): string { return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`; }
+function changeText(item: WorktreeItem): string {
+  const changes = item.worktree?.changes ?? {};
+  const active = Object.entries(changes).filter(([, value]) => value).map(([name]) => name);
+  return active.length ? active.join(", ") : "clean";
+}
+function formatWorktree(item: WorktreeItem): string {
+  const labels = [item.worktree?.current ? "current" : undefined, item.worktree?.main ? "main" : undefined].filter(Boolean);
+  return `${item.branch ?? "(detached)"}${labels.length ? ` [${labels.join(", ")}]` : ""}${item.display?.symbols ? ` ${item.display.symbols}` : ""}`;
+}
+function formatWorktreeStatus(item: WorktreeItem): string {
+  return [
+    `Branch: ${item.branch ?? "(detached)"}`,
+    `Path: ${item.worktree?.path ?? "(no worktree path)"}`,
+    `Current: ${item.worktree?.current ? "yes" : "no"}`,
+    `Primary: ${item.worktree?.main ? "yes" : "no"}`,
+    `State: ${item.display?.state ?? "normal"}`,
+    `Changes: ${changeText(item)}`,
+    `Default branch: ${relationText(item.default_branch)}`,
+    `Upstream: ${relationText(item.upstream)}`,
+    `HEAD: ${item.head?.short_sha ?? "unknown"}${item.head?.subject ? ` ${item.head.subject}` : ""}`,
+  ].join("\n");
+}
+async function chooseWorktree(ctx: ExtensionCommandContext, title: string, items: WorktreeItem[]): Promise<WorktreeItem | undefined> {
+  if (!items.length) return undefined;
+  const options = items.map(formatWorktree);
   const selected = await ctx.ui.select(title, options);
   const index = selected === undefined ? -1 : options.indexOf(selected);
-  return index >= 0 ? worktrees[index] : undefined;
+  return index < 0 ? undefined : items[index];
 }
 
-async function commandList(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-): Promise<void> {
-  requireNoArgs(args, "/wt list");
-  const worktrees = await client.list(ctx.cwd);
-  if (worktrees.length === 0) {
-    ctx.ui.notify("No worktrees found.", "info");
-    return;
+function readSessionTrail(ctx: ExtensionCommandContext): SessionLocation[] {
+  for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
+    if (
+      entry.type !== "custom_message" ||
+      ![SESSION_TRANSITION_MESSAGE, LEGACY_SESSION_TRANSITION_MESSAGE].includes(entry.customType) ||
+      !entry.details ||
+      typeof entry.details !== "object"
+    ) continue;
+    const trail = (entry.details as { trail?: unknown }).trail;
+    if (Array.isArray(trail)) return trail.filter((value): value is SessionLocation =>
+      Boolean(value && typeof value === "object" && typeof value.path === "string" && (typeof value.branch === "string" || value.branch === null)));
   }
-  if (!ctx.hasUI) {
-    ctx.ui.notify(worktrees.map(formatWorktree).join("\n\n"), "info");
-    return;
+  return [];
+}
+function survivingTrail(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[]): SessionLocation[] {
+  return trail.filter((location) => itemForPath(worktrees, location.path));
+}
+function recoveryTarget(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[]): { target?: WorktreeItem; trail: SessionLocation[] } {
+  for (let index = trail.length - 1; index >= 0; index -= 1) {
+    const target = itemForPath(worktrees, trail[index].path);
+    if (target) return { target, trail: trail.slice(0, index) };
   }
-  const selected = await chooseWorktree(
-    ctx,
-    "Select a worktree to inspect",
-    worktrees,
+  return { target: worktrees.find((item) => item.worktree?.main) ?? worktrees.find((item) => item.worktree?.path), trail: [] };
+}
+function nextTrail(trail: readonly SessionLocation[], source: SessionLocation): SessionLocation[] {
+  return [...trail, source].slice(-32);
+}
+function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocation, target: SessionLocation, trail: SessionLocation[], kind: SessionTransitionKind): string {
+  const sourceSession = ctx.sessionManager.getSessionFile();
+  if (!sourceSession) throw new WorktrunkError("Cannot move an ephemeral Pi session.");
+  let snapshot: SessionSnapshot | undefined;
+  if (sessionFileIsUnwritten(sourceSession)) {
+    const header = ctx.sessionManager.getHeader();
+    if (!header) throw new WorktrunkError("The source session has no header.");
+    snapshot = { header: structuredClone(header), entries: structuredClone(ctx.sessionManager.getEntries()) };
+  }
+  const targetSessionDir = targetSessionDirectory(ctx.sessionManager);
+  const { destinationSession } = forkSessionFromSnapshot(sourceSession, target.path, snapshot, targetSessionDir);
+  const destination = SessionManager.open(destinationSession, targetSessionDir);
+  destination.appendCustomMessageEntry(
+    SESSION_TRANSITION_MESSAGE,
+    "",
+    true,
+    { kind, source, target, trail, sourceSession, destinationSession } satisfies SessionTransitionDetails,
   );
-  if (selected) ctx.ui.notify(formatWorktreeStatus(selected), "info");
+  return destinationSession;
 }
-
-async function commandCreate(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-  continueSession: ContinueSession,
-): Promise<void> {
-  const input = parseCreateArgs(args);
-  const created = await client.create(ctx.cwd, input.branch);
-  if (input.continueSession) {
-    try {
-      await continueSession(ctx, created);
-    } catch (error) {
-      throw new WorktrunkError(
-        `Created ${created.branch} at ${created.path}, but could not continue the Pi session: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-    return;
-  }
-  ctx.ui.notify(
-    `Created ${created.branch}.\nPath: ${created.path}\nPi remains in ${ctx.cwd}.`,
-    "info",
-  );
-}
-
-async function commandContinue(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-  continueSession: ContinueSession,
-): Promise<void> {
-  const worktrees = await client.list(ctx.cwd);
-  const candidates = worktrees.filter(
-    (item) => item.worktree?.path && !item.worktree.current,
-  );
-  const target = args
-    ? resolveWorktree(worktrees, args)
-    : ctx.hasUI
-      ? await chooseWorktree(
-          ctx,
-          "Select a worktree in which to continue the session",
-          candidates,
-        )
-      : undefined;
-
-  if (!target) {
-    if (!args && !ctx.hasUI) {
-      throw new WorktrunkError(
-        "Usage: /wt continue <branch-or-path>",
-      );
-    }
-    if (args) throw new WorktrunkError(`Worktree not found: ${args}`);
-    if (candidates.length === 0) {
-      ctx.ui.notify("No other worktrees found.", "info");
-    }
-    return;
-  }
-  if (!target.worktree?.path) {
-    throw new WorktrunkError("The worktree has no path.");
-  }
-  await continueSession(ctx, {
-    branch: target.branch,
-    path: target.worktree.path,
-  });
-}
-
-async function commandRemove(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-): Promise<void> {
-  const worktrees = await client.list(ctx.cwd);
-  const target = args
-    ? resolveWorktree(worktrees, args)
-    : ctx.hasUI
-      ? await chooseWorktree(
-          ctx,
-          "Select a worktree to remove",
-          worktrees.filter(
-            (item) => !item.worktree?.current && !item.worktree?.main,
-          ),
-        )
-      : undefined;
-
-  if (!target) {
-    if (!args && !ctx.hasUI) {
-      throw new WorktrunkError("Usage: /wt remove <branch-or-path>");
-    }
-    if (args) throw new WorktrunkError(`Worktree not found: ${args}`);
-    return;
-  }
-
-  const ref = removableRef(target);
-  if (
-    ctx.hasUI &&
-    !(await ctx.ui.confirm(
-      "Remove worktree?",
-      `${target.branch ?? "(detached)"}\n${target.worktree?.path ?? "(no path)"}\n\nWorktrunk refuses dirty worktrees and retains branches that are not safe to delete.`,
-    ))
-  ) {
-    return;
-  }
-
-  const removal = await client.remove(ctx.cwd, ref);
-  const [outcome] = removal.outcomes;
-  const label = target.branch ?? outcome?.path ?? ref;
-  const branchDeleted =
-    outcome?.branch_outcome === "deleted" || outcome?.branch_deleted === true;
-  ctx.ui.notify(
-    outcome?.branch && !branchDeleted
-      ? `Removed the worktree for ${label}. Worktrunk retained branch ${outcome.branch}.`
-      : branchDeleted
-        ? `Removed the worktree and branch ${label}.`
-        : `Removed worktree ${label}.`,
-    "info",
-  );
-}
-
-async function commandStatus(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-): Promise<void> {
-  requireNoArgs(args, "/wt status");
-  if (!existsSync(ctx.cwd)) {
-    throw new WorktrunkError(missingCwdMessage(ctx.cwd));
-  }
-  const current = await client.status(ctx.cwd);
-  if (!current) {
-    throw new WorktrunkError(
-      "The current directory is not a Worktrunk-managed worktree.",
-    );
-  }
-  ctx.ui.notify(formatWorktreeStatus(current), "info");
-}
-
-async function commandPath(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-): Promise<void> {
-  if (!args && !existsSync(ctx.cwd)) {
-    throw new WorktrunkError(missingCwdMessage(ctx.cwd));
-  }
-  const worktrees = await client.list(ctx.cwd);
-  const target = args
-    ? resolveWorktree(worktrees, args)
-    : worktrees.find((item) => item.worktree?.current);
-  if (!target?.worktree?.path) {
-    throw new WorktrunkError(
-      args ? `Worktree not found: ${args}` : "Current worktree not found.",
-    );
-  }
-  ctx.ui.notify(target.worktree.path, "info");
-}
-
-async function commandSettings(
-  args: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-): Promise<void> {
-  requireNoArgs(args, "/wt settings");
-  const settings = await client.settingsText(ctx.cwd);
-  ctx.ui.notify(settings || "No Worktrunk configuration found.", "info");
-}
-
-export async function handleWorktreeCommand(
-  input: string,
-  ctx: ExtensionCommandContext,
-  client: WorktrunkClient,
-  continueSession: ContinueSession = continueSessionInWorktree,
-  aliases: readonly string[] = [],
-): Promise<void> {
-  const { command: rawCommand, args } = splitCommand(input);
-  const command =
-    rawCommand === "ls"
-      ? "list"
-      : rawCommand === "rm"
-        ? "remove"
-        : rawCommand === "config"
-          ? "settings"
-          : rawCommand;
-
-  try {
-    switch (command) {
-      case "help":
-        ctx.ui.notify(helpText(aliases), "info");
-        return;
-      case "list":
-        await commandList(args, ctx, client);
-        return;
-      case "create":
-        await commandCreate(args, ctx, client, continueSession);
-        return;
-      case "continue":
-        await commandContinue(args, ctx, client, continueSession);
-        return;
-      case "remove":
-        await commandRemove(args, ctx, client);
-        return;
-      case "status":
-        await commandStatus(args, ctx, client);
-        return;
-      case "cd":
-        await commandPath(args, ctx, client);
-        return;
-      case "settings":
-        await commandSettings(args, ctx, client);
-        return;
-      default:
-        ctx.ui.notify(
-          `Unknown worktree command: ${rawCommand}\n\n${helpText(aliases)}`,
-          "error",
-        );
-    }
-  } catch (error) {
-    ctx.ui.notify(
-      error instanceof Error ? error.message : String(error),
-      "error",
-    );
-  }
-}
-
-async function formatToolOutput(
-  action: string,
-  output: string,
-  suffix?: string,
-) {
-  const text = output || "(no output)";
-  const truncation = truncateHead(text, {
-    maxLines: DEFAULT_MAX_LINES,
-    maxBytes: DEFAULT_MAX_BYTES,
-  });
-  if (!truncation.truncated) {
-    return { text, truncated: false as const };
-  }
-
-  const directory = await mkdtemp(join(tmpdir(), "pi-worktrunk-"));
-  const filename = suffix ? `${action}-${suffix}.txt` : `${action}.txt`;
-  const fullOutputPath = join(directory, filename);
-  await writeFile(fullOutputPath, text, "utf8");
-  const notice =
-    `\n\n[Output truncated to ${DEFAULT_MAX_LINES} lines or ` +
-    `${formatSize(DEFAULT_MAX_BYTES)}. Full output: ${fullOutputPath}]`;
-  return {
-    text: truncation.content + notice,
-    truncated: true as const,
-    fullOutputPath,
-  };
-}
-
-async function runWorktrunkAlias(
-  alias: string,
-  args: string[],
-  cwd: string,
-  signal: AbortSignal | undefined,
-  runWt: RunWt,
-) {
-  let result: WtResult;
-  try {
-    result = await runWt([alias, ...args], { cwd, signal });
-  } catch (error) {
-    throw new WorktrunkError(
-      !existsSync(cwd)
-        ? missingCwdMessage(cwd)
-        : `Could not execute Worktrunk: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-    );
-  }
-  if (result.code !== 0 || result.killed) {
-    throw new WorktrunkError(formatWtFailure([alias, ...args], result, cwd));
-  }
-
-  const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()]
-    .filter(Boolean)
-    .join("\n");
-  const rendered = await formatToolOutput(
-    `alias-${alias}`,
-    output || `wt ${alias} completed.`,
-  );
-  return { ...rendered, cwdExists: existsSync(cwd) };
-}
-
-function aliasRecoveryHint(cwdExists: boolean): string {
-  return cwdExists
-    ? ""
-    :
-      "\n\nThe alias removed Pi's working directory. Use " +
-      "`/wt continue <target>` to continue this session in an " +
-      "existing worktree.";
-}
-
-async function handleWorktrunkAliasCommand(
-  alias: string,
-  input: string,
-  ctx: ExtensionCommandContext,
-  runWt: RunWt,
-): Promise<void> {
-  try {
-    const result = await runWorktrunkAlias(
-      alias,
-      parseAliasArguments(input),
-      ctx.cwd,
-      ctx.signal,
-      runWt,
-    );
-    ctx.ui.notify(result.text + aliasRecoveryHint(result.cwdExists), "info");
-  } catch (error) {
-    ctx.ui.notify(
-      error instanceof Error ? error.message : String(error),
-      "error",
-    );
-  }
-}
-
-async function toolResult(
-  action: WorktreeAction,
-  value: unknown,
-  display?: string,
-) {
-  const text =
-    typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const output = await formatToolOutput(action, text);
-  const rendered = display
-    ? await formatToolOutput(action, display, "display")
-    : undefined;
-  const details: ToolOutputDetails = {
-    action,
-    truncated: output.truncated,
-    ...(output.fullOutputPath
-      ? { fullOutputPath: output.fullOutputPath }
-      : {}),
-    ...(rendered
-      ? {
-          display: rendered.text,
-          displayTruncated: rendered.truncated,
-          ...(rendered.fullOutputPath
-            ? { displayFullOutputPath: rendered.fullOutputPath }
-            : {}),
-        }
-      : {}),
-  };
-  return {
-    content: [{ type: "text" as const, text: output.text }],
-    details,
-  };
-}
-
-class WorktrunkOutput implements Component {
-  private readonly text: string;
-
-  constructor(text: string) {
-    this.text = text;
-  }
-
-  render(width: number): string[] {
-    return this.text
-      .split("\n")
-      .map((line) => truncateToWidth(line, Math.max(1, width), "…"));
-  }
-
-  invalidate(): void {}
-}
-
-function resultText(result: {
-  content: Array<{ type: string; text?: string }>;
-  details?: unknown;
-}): string {
-  const details = result.details as ToolOutputDetails | undefined;
-  if (details?.display) return details.display;
-  const text = result.content.find((item) => item.type === "text")?.text;
-  return text ?? "";
-}
-
-async function tuiDisplay(
-  mode: string,
-  getDisplay: () => Promise<string>,
-): Promise<string | undefined> {
-  if (mode !== "tui") return undefined;
-  try {
-    return await getDisplay();
-  } catch {
-    return undefined;
-  }
-}
-
-async function removeWithTool(
-  client: WorktrunkClient,
-  cwd: string,
-  targetRef: string | undefined,
-  signal?: AbortSignal,
-) {
-  const ref = targetRef?.trim();
-  if (!ref) throw new WorktrunkError("The remove action requires `target`.");
-  const target = resolveWorktree(await client.list(cwd, signal), ref);
-  if (!target) throw new WorktrunkError(`Worktree not found: ${ref}`);
-  return client.remove(cwd, removableRef(target), signal);
-}
-
-const WorktreeActionSchema = Type.Unsafe<WorktreeAction>({
-  type: "string",
-  enum: WORKTREE_ACTIONS,
-  description: "The Worktrunk operation to perform.",
-});
-
-const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
-
-type RepositoryIdentity = {
-  commonDir: string;
-  device: number;
-  inode: number;
-};
 
 function repositoryIdentity(commonDir: string): RepositoryIdentity | undefined {
-  try {
-    const stat = statSync(commonDir);
-    return { commonDir, device: stat.dev, inode: stat.ino };
-  } catch {
-    return undefined;
-  }
+  try { const stat = statSync(commonDir); return { commonDir, device: stat.dev, inode: stat.ino }; } catch { return undefined; }
 }
-
-function sameRepositoryIdentity(
-  left: RepositoryIdentity | undefined,
-  right: RepositoryIdentity | undefined,
-): boolean {
-  return Boolean(
-    left &&
-      right &&
-      left.commonDir === right.commonDir &&
-      left.device === right.device &&
-      left.inode === right.inode,
-  );
+function sameRepositoryIdentity(left?: RepositoryIdentity, right?: RepositoryIdentity): boolean {
+  return Boolean(left && right && left.commonDir === right.commonDir && left.device === right.device && left.inode === right.inode);
 }
-
 function gitWorktreePaths(output: string): string[] {
-  return output
-    .split("\0")
-    .filter((field) => field.startsWith("worktree "))
-    .map((field) => field.slice("worktree ".length));
+  return output.split("\0").filter((field) => field.startsWith("worktree ")).map((field) => field.slice(9));
 }
 
-export default function (pi: ExtensionAPI) {
+export default function extension(pi: ExtensionAPI) {
+  const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
+    (message, { expanded, outputPad }, theme) => {
+    const details = message.details as Partial<SessionTransitionDetails> | undefined;
+    const recovery = details?.kind === "recovery";
+    const source = details?.source;
+    const target = details?.target;
+    const label = (location: SessionLocation) => location.branch ?? basename(location.path);
+    const compactPath = (path: string) => path === homedir() || path.startsWith(`${homedir()}${sep}`) ? `~${path.slice(homedir().length)}` : path;
+    let text = theme.fg("accent", theme.bold(`${recovery ? "↩ Session recovered" : "↪ Session moved"}`));
+    if (source?.path && target?.path) {
+      text += `\n  ${theme.fg("muted", label(source))} ${theme.fg("dim", "→")} ${theme.fg("accent", theme.bold(label(target)))}`;
+      if (expanded) text += `\n\n  ${theme.fg("dim", "From")}  ${compactPath(source.path)}\n  ${theme.fg("dim", "To")}    ${compactPath(target.path)}`;
+    }
+    return new Text(text, outputPad, 0);
+  };
+  pi.registerMessageRenderer?.(SESSION_TRANSITION_MESSAGE, renderTransition);
+  pi.registerMessageRenderer?.(LEGACY_SESSION_TRANSITION_MESSAGE, renderTransition);
+
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let storedRepositoryIdentity: RepositoryIdentity | undefined;
+  let aliases: WorktrunkAlias[] = [];
+  let pendingContinuation: PendingContinuation | undefined;
+  let placementInFlight = false;
+  const aliasNames = new Set<string>();
 
-  async function readCommonDir(
-    cwd: string,
-    signal?: AbortSignal,
-  ): Promise<string | undefined> {
+  async function readCommonDir(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
     if (!existsSync(cwd)) return undefined;
-    const result = await pi.exec(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { cwd, signal },
-    );
-    if (result.code !== 0 || !result.stdout.trim()) return undefined;
-    return resolve(cwd, result.stdout.trim());
+    const result = await pi.exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, signal });
+    return result.code === 0 && result.stdout.trim() ? resolve(cwd, result.stdout.trim()) : undefined;
   }
-
-  async function findRepositoryWorktree(
-    signal?: AbortSignal,
-  ): Promise<string | undefined> {
+  async function findRepositoryWorktree(signal?: AbortSignal): Promise<string | undefined> {
     const identity = storedRepositoryIdentity;
-    if (
-      !identity ||
-      !sameRepositoryIdentity(identity, repositoryIdentity(identity.commonDir))
-    ) {
-      return undefined;
-    }
-    const commonDir = identity.commonDir;
-    const result = await pi.exec(
-      "git",
-      ["--git-dir", commonDir, "worktree", "list", "--porcelain", "-z"],
-      { cwd: dirname(commonDir), signal },
-    );
+    if (!identity || !sameRepositoryIdentity(identity, repositoryIdentity(identity.commonDir))) return undefined;
+    const result = await pi.exec("git", ["--git-dir", identity.commonDir, "worktree", "list", "--porcelain", "-z"], { cwd: dirname(identity.commonDir), signal });
     if (result.code !== 0) return undefined;
-
     for (const path of gitWorktreePaths(result.stdout)) {
-      if (!existsSync(path)) continue;
-      if ((await readCommonDir(path, signal)) === commonDir) return path;
+      if (existsSync(path) && (await readCommonDir(path, signal)) === identity.commonDir) return path;
     }
     return undefined;
   }
-
   const runWt: RunWt = async (args, options) => {
     const { cwdMode, ...execOptions } = options ?? {};
-    const requestedCwd = execOptions.cwd;
-    if (
-      !requestedCwd ||
-      existsSync(requestedCwd) ||
-      cwdMode !== "repository-read"
-    ) {
-      return execWt(args, execOptions);
-    }
-    const fallbackCwd = await findRepositoryWorktree(execOptions.signal);
-    if (!fallbackCwd) return execWt(args, execOptions);
-    const result = await execWt(args, { ...execOptions, cwd: fallbackCwd });
-    return { ...result, relocated: true };
+    if (!execOptions.cwd || existsSync(execOptions.cwd) || cwdMode !== "repository-read") return execWt(args, execOptions);
+    const fallback = await findRepositoryWorktree(execOptions.signal);
+    if (!fallback) return execWt(args, execOptions);
+    return { ...(await execWt(args, { ...execOptions, cwd: fallback })), relocated: true };
   };
-  const tracker = createMarkerUpdater(execWt);
   const client = createWorktrunkClient(runWt);
-  const worktrunkAliases = new Set<string>();
-  let worktrunkAliasMetadata: WorktrunkAlias[] = [];
+  const tracker = createMarkerUpdater(execWt);
 
-  async function discoverAliases(ctx: ExtensionContext) {
-    worktrunkAliases.clear();
-    worktrunkAliasMetadata = [];
-    let result: WtResult;
-    try {
-      result = await runWt(["--help"], {
-        cwd: ctx.cwd,
-        cwdMode: "repository-read",
-      });
-    } catch {
-      return;
-    }
-    if (result.code !== 0) return;
-
-    for (const alias of parseWorktrunkAliasNames(result.stdout ?? "")) {
-      if (!RESERVED_SUBCOMMANDS.has(alias)) worktrunkAliases.add(alias);
-    }
-    if (worktrunkAliases.size === 0) return;
-    worktrunkAliasMetadata = [...worktrunkAliases].map((name) => ({
-      name,
-      steps: [],
-    }));
-    try {
-      worktrunkAliasMetadata = parseWorktrunkAliasMetadata(
-        [...worktrunkAliases],
-        await client.settings(ctx.cwd, ctx.signal),
-      );
-    } catch {
-      // Alias names are still useful when structured configuration is unavailable.
-    }
+  async function safeList(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
+    try { return await client.list(cwd, signal); } catch { return []; }
   }
-
-  function registerWorktrunkAliasTool() {
-    if (worktrunkAliasMetadata.length === 0) return;
-    const catalog = worktrunkAliasMetadata
-      .map(({ name, steps }) =>
-        steps.length > 0
-          ? `- ${name}: ${steps.join(" -> ")}`
-          : `- ${name}`,
-      )
-      .join("\n");
-    const aliasNames = worktrunkAliasMetadata.map(({ name }) => name);
-    const AliasNameSchema = Type.Unsafe<string>({
-      type: "string",
-      enum: aliasNames,
-      description: `Configured Worktrunk alias to run. Available aliases:\n${catalog}`,
-    });
-
-    pi.registerTool({
-      name: "worktree_alias",
-      label: "Worktrunk Alias",
-      description:
-        "Run a configured Worktrunk alias after the user confirms the exact " +
-        "invocation. Alias pipelines may merge, deploy, publish, remove " +
-        "worktrees, or perform other external actions.",
-      promptSnippet: `Run explicitly requested Worktrunk aliases: ${aliasNames.join(", ")}`,
-      promptGuidelines: [
-        "Use worktree_alias when the user explicitly requests an action that matches a configured Worktrunk alias.",
-        "Only pass worktree_alias arguments that the user explicitly supplied; do not infer flags or operands.",
-        "Do not call worktree_alias based only on an inferred next step; aliases may perform destructive or external actions.",
-      ],
-      parameters: Type.Object(
-        {
-          alias: AliasNameSchema,
-          args: Type.Optional(
-            Type.Array(
-              Type.String({
-                description:
-                  "One argument passed directly to the alias without shell expansion.",
-              }),
-              {
-                description:
-                  "Arguments explicitly supplied by the user and passed directly to the alias.",
-              },
-            ),
-          ),
-        },
-        { additionalProperties: false },
-      ),
-      executionMode: "sequential",
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const alias = params.alias.trim();
-        if (!worktrunkAliases.has(alias)) {
-          throw new WorktrunkError(
-            `Worktrunk alias not available: ${alias || "(empty)"}. ` +
-              `Available aliases: ${aliasNames.join(", ")}.`,
-          );
-        }
-        const args = params.args ?? [];
-        if (!ctx.hasUI) {
-          throw new WorktrunkError(
-            "Running a Worktrunk alias requires interactive or RPC mode so the user can confirm the exact command.",
-          );
-        }
-        const metadata = worktrunkAliasMetadata.find(
-          (candidate) => candidate.name === alias,
-        );
-        const formattedArgs = args.map((value) => JSON.stringify(value));
-        const command = ["wt", alias, ...formattedArgs].join(" ");
-        const confirmed = await ctx.ui.confirm(
-          `Run Worktrunk alias ${alias}?`,
-          [
-            `Command: ${command}`,
-            ...(metadata?.steps.length
-              ? [`Pipeline: ${metadata.steps.join(" -> ")}`]
-              : []),
-            "",
-            "This alias may perform destructive or external actions.",
-          ].join("\n"),
-        );
-        if (!confirmed) {
-          const details: AliasToolOutputDetails = {
-            alias,
-            args,
-            cancelled: true,
-            truncated: false,
-          };
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Cancelled Worktrunk alias ${alias}.`,
-              },
-            ],
-            details,
-          };
-        }
-
-        const result = await runWorktrunkAlias(
-          alias,
-          args,
-          ctx.cwd,
-          signal,
-          runWt,
-        );
-        const details: AliasToolOutputDetails = {
-          alias,
-          args,
-          truncated: result.truncated,
-          ...(result.fullOutputPath
-            ? { fullOutputPath: result.fullOutputPath }
-            : {}),
-        };
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: result.text + aliasRecoveryHint(result.cwdExists),
-            },
-          ],
-          details,
-        };
-      },
-      renderCall(args, theme) {
-        let text = theme.fg("toolTitle", theme.bold("Worktrunk Alias"));
-        if (args.alias) text += ` › ${theme.fg("accent", args.alias)}`;
-        if (args.args?.length) {
-          text += ` ${theme.fg("muted", args.args.join(" "))}`;
-        }
-        return new Text(text, 0, 0);
-      },
-      renderResult(result) {
-        return new Text(resultText(result), 0, 0);
-      },
-    });
-  }
-
   async function restoreRepositoryIdentity(ctx: ExtensionContext) {
-    const stored = [...ctx.sessionManager.getEntries()]
-      .reverse()
-      .find(
-        (entry) =>
-          entry.type === "custom" &&
-          entry.customType === REPOSITORY_IDENTITY_ENTRY &&
-          typeof entry.data === "object" &&
-          entry.data !== null &&
-          "commonDir" in entry.data &&
-          typeof entry.data.commonDir === "string",
-      );
-    if (stored?.type === "custom") {
-      const data = stored.data as Partial<RepositoryIdentity>;
-      if (
-        typeof data.commonDir === "string" &&
-        typeof data.device === "number" &&
-        typeof data.inode === "number"
-      ) {
-        const identity = data as RepositoryIdentity;
-        if (
-          sameRepositoryIdentity(
-            identity,
-            repositoryIdentity(identity.commonDir),
-          )
-        ) {
-          storedRepositoryIdentity = identity;
-        }
+    const stored = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && entry.customType === REPOSITORY_IDENTITY_ENTRY);
+    if (stored?.type === "custom" && stored.data && typeof stored.data === "object") {
+      const value = stored.data as Partial<RepositoryIdentity>;
+      if (typeof value.commonDir === "string" && typeof value.device === "number" && typeof value.inode === "number") {
+        const identity = value as RepositoryIdentity;
+        if (sameRepositoryIdentity(identity, repositoryIdentity(identity.commonDir))) storedRepositoryIdentity = identity;
       }
     }
-
     try {
-      const commonDir = await readCommonDir(ctx.cwd);
+      const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
       if (!commonDir) return;
       const identity = repositoryIdentity(commonDir);
-      if (
-        !identity ||
-        sameRepositoryIdentity(identity, storedRepositoryIdentity)
-      ) {
-        return;
-      }
+      if (!identity || sameRepositoryIdentity(identity, storedRepositoryIdentity)) return;
       storedRepositoryIdentity = identity;
       pi.appendEntry(REPOSITORY_IDENTITY_ENTRY, identity);
-    } catch {
-      // A restored identity can still recover a session whose cwd is gone.
+    } catch {}
+  }
+  async function discoverAliases(ctx: ExtensionContext) {
+    aliases = [];
+    aliasNames.clear();
+    let help: WtResult;
+    try { help = await runWt(["--help"], { cwd: ctx.cwd, cwdMode: "repository-read" }); } catch { return; }
+    if (help.code !== 0) return;
+    for (const name of parseWorktrunkAliasNames(help.stdout ?? "")) aliasNames.add(name);
+    aliases = [...aliasNames].map((name) => ({ name, steps: [] }));
+    if (!aliases.length) return;
+    try { aliases = parseWorktrunkAliasMetadata([...aliasNames], await client.settings(ctx.cwd, ctx.signal)); } catch {}
+  }
+  function emit(ctx: ExtensionCommandContext, message: string, level: "info" | "warning" | "error") {
+    if (ctx.mode === "print") process.stdout.write(`${message}\n`);
+    else if (ctx.mode === "json") pi.sendMessage({ customType: "pi-worktrunk-command", content: message, display: true, details: { level } });
+    else ctx.ui.notify(message, level);
+  }
+  async function locationFor(item: WorktreeItem, signal?: AbortSignal): Promise<SessionLocation> {
+    if (!item.worktree?.path) throw new WorktrunkError("The target worktree has no path.");
+    return worktreeLocation(item, item.worktree.path, await readCommonDir(item.worktree.path, signal));
+  }
+  function continuationMessage(invocation: Invocation, execution: Execution) {
+    const status = execution.result.code === 0 && !execution.result.killed
+      ? "completed successfully"
+      : "failed";
+    const output = execution.output
+      ? execution.output.slice(0, MAX_CONTINUATION_OUTPUT)
+      : "(no output)";
+    return {
+      customType: CONTINUATION_MESSAGE_TYPE,
+      content:
+        `Worktrunk invocation \`wt ${invocation.args.join(" ")}\` ${status} ` +
+        `(exit ${execution.result.code}).\n\n${output}\n\n` +
+        "Continue the original task in this worktree. Do not repeat the Worktrunk invocation.",
+      display: false,
+    } as const;
+  }
+  async function activate(
+    ctx: ExtensionCommandContext,
+    source: SessionLocation,
+    target: SessionLocation,
+    trail: SessionLocation[],
+    kind: SessionTransitionKind,
+    continuation?: ReturnType<typeof continuationMessage>,
+  ) {
+    const destinationSession = createLinkedSession(ctx, source, target, trail, kind);
+    const result = await ctx.switchSession(destinationSession, {
+      withSession: async (nextCtx) => {
+        nextCtx.ui.notify(`Session ${kind === "recovery" ? "recovered" : "moved"} from ${source.branch ?? source.path} to ${target.branch ?? target.path}.`, "info");
+        if (continuation) {
+          await nextCtx.sendMessage(continuation, { triggerTurn: true });
+        }
+      },
+    });
+    if (result.cancelled) throw new WorktrunkError(`Pi created ${destinationSession}, but session switching was cancelled.`);
+  }
+
+  async function executeInvocation(invocation: Invocation, ctx: ExtensionCommandContext, modelOrigin = false): Promise<Execution> {
+    await ctx.waitForIdle();
+    const interactive = ctx.mode !== "print" && ctx.mode !== "json";
+    if (!modelOrigin && isBareCommand(invocation, "list") && interactive && ctx.hasUI) {
+      const worktrees = await client.list(ctx.cwd, ctx.signal);
+      if (!worktrees.length) ctx.ui.notify("No worktrees found.", "info");
+      else {
+        const selected = await chooseWorktree(ctx, "Select a worktree to inspect", worktrees);
+        if (selected) ctx.ui.notify(formatWorktreeStatus(selected), "info");
+      }
+      return { result: { code: 0 }, output: "", moved: false, canContinue: true };
+    }
+
+    const trail = readSessionTrail(ctx);
+    const before = await safeList(ctx.cwd, ctx.signal);
+    const sourceItem = itemForPath(before, ctx.cwd) ?? before.find((item) => item.worktree?.current);
+    const source = worktreeLocation(sourceItem, ctx.cwd, storedRepositoryIdentity?.commonDir);
+    let args = invocation.args;
+    let selected: WorktreeItem | undefined;
+    if (!modelOrigin && isBareCommand(invocation, "switch") && interactive && ctx.hasUI) {
+      selected = await chooseWorktree(ctx, "Select a worktree", before.filter((item) => item.worktree?.path));
+      if (!selected?.worktree?.path) {
+        return { result: { code: 0 }, output: "", moved: false, canContinue: true };
+      }
+      args = ["switch", selected.worktree.path];
+    }
+
+    let result: WtResult;
+    try { result = await runWt(args, { cwd: ctx.cwd, signal: ctx.signal, cwdMode: "repository-read" }); }
+    catch (error) { result = { code: -1, stderr: error instanceof Error ? error.message : String(error) }; }
+    const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n");
+    if (output) emit(ctx, output, result.code === 0 ? "info" : "error");
+    const base: Execution = { result, output, moved: false, canContinue: existsSync(ctx.cwd) };
+    const continuation = modelOrigin ? continuationMessage(invocation, base) : undefined;
+
+    const after = await safeList(ctx.cwd, ctx.signal);
+    if (!existsSync(ctx.cwd)) {
+      const recovery = recoveryTarget(trail, after);
+      if (!recovery.target?.worktree?.path) {
+        emit(ctx, "Pi's worktree was removed and no surviving worktree was found.", "error");
+        return { ...base, canContinue: false };
+      }
+      if (!interactive || !ctx.sessionManager.getSessionFile()) {
+        emit(ctx, `The current worktree was removed. Continue from ${recovery.target.worktree.path}.`, "warning");
+        return { ...base, canContinue: false };
+      }
+      try {
+        await activate(
+          ctx,
+          source,
+          await locationFor(recovery.target, ctx.signal),
+          recovery.trail,
+          "recovery",
+          continuation,
+        );
+        return { ...base, moved: true, canContinue: true };
+      } catch (error) {
+        emit(ctx, error instanceof Error ? error.message : String(error), "error");
+        return { ...base, canContinue: false };
+      }
+    }
+    if (result.code !== 0 || result.killed) return base;
+
+    let target = selected ?? uniqueCreatedTarget(before, after);
+    if (!target) {
+      const exact = exactSwitchTarget(invocation);
+      if (exact) target = resolveWorktree(after, exact);
+    }
+    if (!target?.worktree?.path) return base;
+    if (canonicalPath(target.worktree.path) === canonicalPath(ctx.cwd)) return base;
+    if (!interactive || !ctx.sessionManager.getSessionFile()) return base;
+    try {
+      await activate(
+        ctx,
+        source,
+        await locationFor(target, ctx.signal),
+        nextTrail(survivingTrail(trail, after), source),
+        "move",
+        continuation,
+      );
+      return { ...base, moved: true };
+    } catch (error) {
+      emit(ctx, error instanceof Error ? error.message : String(error), "error");
+      return base;
     }
   }
 
   pi.registerCommand("wt", {
-    description: "Manage git worktrees with Worktrunk",
-    getArgumentCompletions(argumentPrefix) {
-      const prefix = argumentPrefix.trimStart();
-      if (/\s/.test(prefix)) return null;
-      return [...SUBCOMMANDS, ...worktrunkAliases]
-        .filter((command) => command.startsWith(prefix))
-        .map((command) => ({ value: command, label: command }));
+    description: "Run Worktrunk",
+    getArgumentCompletions(prefix) {
+      const value = prefix.trimStart();
+      if (/\s/.test(value)) return null;
+      return [...SUBCOMMANDS, ...aliasNames].filter((name) => name.startsWith(value)).map((name) => ({ value: name, label: name }));
     },
-    handler: (input, ctx) => {
-      const { command, args } = splitCommand(input);
-      if (worktrunkAliases.has(command)) {
-        return handleWorktrunkAliasCommand(command, args, ctx, runWt);
+    async handler(input, ctx) {
+      let modelOrigin = false;
+      try {
+        const received = parseWtInvocation(input);
+        const marker = received.args.at(-1);
+        const nonce = marker?.startsWith(CONTINUATION_ARG_PREFIX)
+          ? marker.slice(CONTINUATION_ARG_PREFIX.length)
+          : undefined;
+        const args = nonce ? received.args.slice(0, -1) : received.args;
+        const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
+        const key = JSON.stringify(invocation.args);
+        if (
+          nonce &&
+          pendingContinuation?.nonce === nonce &&
+          pendingContinuation.expiresAt <= Date.now()
+        ) {
+          pendingContinuation = undefined;
+          placementInFlight = false;
+        }
+        modelOrigin = Boolean(
+          nonce &&
+          pendingContinuation &&
+          pendingContinuation.expiresAt > Date.now() &&
+          pendingContinuation.nonce === nonce &&
+          pendingContinuation.key === key,
+        );
+        if (nonce && !modelOrigin) {
+          throw new WorktrunkError("Invalid or expired model continuation token.");
+        }
+        if (modelOrigin) pendingContinuation = undefined;
+        const execution = await executeInvocation(invocation, ctx, modelOrigin);
+        if (modelOrigin && !execution.moved && execution.canContinue) {
+          pi.sendMessage(continuationMessage(invocation, execution), { triggerTurn: true });
+        }
+      } catch (error) {
+        emit(ctx, error instanceof Error ? error.message : String(error), "error");
+      } finally {
+        if (modelOrigin) placementInFlight = false;
       }
-      return handleWorktreeCommand(
-        input,
-        ctx,
-        client,
-        continueSessionInWorktree,
-        [...worktrunkAliases],
-      );
     },
   });
 
-  pi.registerTool({
-    name: "worktree",
-    label: "Worktrunk",
-    description:
-      `Manage git worktrees through Worktrunk 0.70 or later. Actions: list all worktrees; status for the current worktree; create using \`branch\`; remove a safe non-current worktree using \`target\`; path to resolve \`target\` (or the current worktree); and settings to inspect active configuration. Creating or resolving a worktree does not change Pi's current working directory. Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
-    promptSnippet: "List, inspect, create, and safely remove Worktrunk worktrees",
-    promptGuidelines: [
-      "Use the worktree tool when the user asks to inspect or manage Worktrunk worktrees.",
-      "Only use the worktree remove action when the user explicitly asks to remove a worktree.",
-      "The worktree tool returns target paths but cannot switch Pi's active session; use /wt continue for an interactive session transition.",
-    ],
-    parameters: Type.Object(
-      {
-        action: WorktreeActionSchema,
-        branch: Type.Optional(
-          Type.String({ description: "Branch name for the create action." }),
-        ),
-        target: Type.Optional(
-          Type.String({
-            description:
-              "Branch name, absolute path, or worktree directory name for remove or path.",
-          }),
-        ),
+  function registerTool() {
+    const catalog = aliases.length
+      ? `\n\nConfigured aliases:\n${aliases.map(({ name, steps }) => `- ${name}: ${steps.length ? steps.join(" -> ") : "no pipeline metadata available"}`).join("\n")}`
+      : "";
+    pi.registerTool({
+      name: "worktrunk",
+      label: "Worktrunk",
+      description: `Run a Worktrunk command. Arguments pass directly to wt without shell expansion. Commands that identify one destination move the Pi session there.${catalog}`,
+      promptSnippet: "Run Worktrunk commands and continue in a uniquely identified destination worktree",
+      promptGuidelines: [
+        "Use worktrunk for Worktrunk commands. Pass the exact wt arguments without a leading wt.",
+        "The worktrunk tool moves the session automatically when Worktrunk identifies one destination.",
+      ],
+      parameters: Type.Object({ args: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false }),
+      executionMode: "sequential",
+      async execute(_id, params, _signal, _update, ctx) {
+        const args = [...params.args];
+        const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
+        if (isBareCommand(invocation, "switch")) {
+          throw new WorktrunkError("The worktrunk tool requires an explicit target for `wt switch`.");
+        }
+        if (pendingContinuation && pendingContinuation.expiresAt <= Date.now()) {
+          pendingContinuation = undefined;
+          placementInFlight = false;
+        }
+        if (placementInFlight) {
+          throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending.");
+        }
+
+        const alias = invocation.command;
+        const sensitive = sensitiveGlobalOption(args);
+        const unknown = alias !== undefined &&
+          !SUBCOMMANDS.includes(alias as (typeof SUBCOMMANDS)[number]) &&
+          !aliasNames.has(alias);
+        const requiresConfirmation = Boolean(
+          (alias && aliasNames.has(alias)) || sensitive || unknown,
+        );
+        if (requiresConfirmation) {
+          if (!ctx.hasUI) {
+            throw new WorktrunkError("This Worktrunk invocation requires interactive or RPC mode so the user can confirm the exact command.");
+          }
+          const metadata = aliases.find((candidate) => candidate.name === alias);
+          const reason = metadata
+            ? `Configured alias: ${alias}`
+            : sensitive
+              ? `Sensitive global option: ${sensitive}`
+              : `Unrecognized command: ${alias}`;
+          const confirmed = await ctx.ui.confirm(
+            "Run Worktrunk command?",
+            [
+              `Command: wt ${args.map(quoteArgument).join(" ")}`,
+              reason,
+              ...(metadata?.steps.length ? [`Pipeline: ${metadata.steps.join(" -> ")}`] : []),
+              "",
+              "This command may perform destructive or external actions.",
+            ].join("\n"),
+          );
+          if (!confirmed) {
+            return {
+              content: [{ type: "text" as const, text: `Cancelled wt ${args.join(" ")}.` }],
+              details: { args, cancelled: true },
+              terminate: true,
+            };
+          }
+        }
+        const nonce = randomUUID();
+        placementInFlight = true;
+        pendingContinuation = {
+          key: JSON.stringify(args),
+          nonce,
+          expiresAt: Date.now() + 5 * 60_000,
+        };
+        const marker = `${CONTINUATION_ARG_PREFIX}${nonce}`;
+        pi.sendUserMessage(
+          `/wt ${[...args, marker].map(quoteArgument).join(" ")}`,
+          { deliverAs: "followUp", expandPromptTemplates: true },
+        );
+        return {
+          content: [{ type: "text" as const, text: `Queued wt ${args.join(" ")}. Worktrunk will run after this turn, and the result will be returned before work continues.` }],
+          details: { args },
+          terminate: true,
+        };
       },
-      { additionalProperties: false },
-    ),
-    executionMode: "sequential",
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      switch (params.action) {
-        case "list": {
-          const currentDirectoryExists = existsSync(ctx.cwd);
-          const worktrees = await client.list(ctx.cwd, signal);
-          const display = currentDirectoryExists
-            ? await tuiDisplay(ctx.mode, () =>
-                client.listText(ctx.cwd, signal),
-              )
-            : undefined;
-          return toolResult(
-            "list",
-            {
-              worktrees,
-              currentDirectory: ctx.cwd,
-              currentDirectoryExists,
-            },
-            display,
-          );
-        }
-        case "status": {
-          if (!existsSync(ctx.cwd)) {
-            throw new WorktrunkError(missingCwdMessage(ctx.cwd));
-          }
-          const current = await client.status(ctx.cwd, signal);
-          if (!current) {
-            throw new WorktrunkError(
-              "The current directory is not a Worktrunk-managed worktree.",
-            );
-          }
-          return toolResult("status", current, current.display?.statusline);
-        }
-        case "create": {
-          const result = await client.create(
-            ctx.cwd,
-            requireBranch(params.branch?.trim() ?? ""),
-            signal,
-          );
-          const {
-            display,
-            branch,
-            path,
-            createdBranch,
-            baseBranch,
-          } = result;
-          return toolResult(
-            "create",
-            {
-              created: { branch, path, createdBranch, baseBranch },
-              currentDirectory: ctx.cwd,
-              directoryChanged: false,
-            },
-            display,
-          );
-        }
-        case "remove": {
-          const removal = await removeWithTool(
-            client,
-            ctx.cwd,
-            params.target,
-            signal,
-          );
-          return toolResult(
-            "remove",
-            { removed: removal.outcomes },
-            removal.display,
-          );
-        }
-        case "path": {
-          const ref = params.target?.trim();
-          if (!ref && !existsSync(ctx.cwd)) {
-            throw new WorktrunkError(missingCwdMessage(ctx.cwd));
-          }
-          const worktrees = await client.list(ctx.cwd, signal);
-          const target = ref
-            ? resolveWorktree(worktrees, ref)
-            : worktrees.find((item) => item.worktree?.current);
-          if (!target?.worktree?.path) {
-            throw new WorktrunkError(
-              ref ? `Worktree not found: ${ref}` : "Current worktree not found.",
-            );
-          }
-          return toolResult(
-            "path",
-            {
-              branch: target.branch,
-              path: target.worktree.path,
-              currentDirectory: ctx.cwd,
-              directoryChanged: false,
-            },
-            target.worktree.path,
-          );
-        }
-        case "settings": {
-          const settings = await client.settings(ctx.cwd, signal);
-          const display = await tuiDisplay(ctx.mode, () =>
-            client.settingsText(ctx.cwd, signal),
-          );
-          return toolResult("settings", settings, display);
-        }
-      }
-    },
-    renderCall(args, theme) {
-      let text =
-        theme.fg("toolTitle", theme.bold("Worktrunk")) +
-        ` › ${theme.fg("toolTitle", theme.bold(args.action))}`;
-      const operand = args.branch ?? args.target;
-      if (operand) text += ` ${theme.fg("accent", operand)}`;
-      return new Text(text, 0, 0);
-    },
-    renderResult(result) {
-      const details = result.details as ToolOutputDetails | undefined;
-      const text = resultText(result);
-      return details?.action === "list" || details?.action === "status"
-        ? new WorktrunkOutput(text)
-        : new Text(text, 0, 0);
-    },
-  });
+      renderCall(args, theme) {
+        let text = theme.fg("toolTitle", theme.bold("Worktrunk"));
+        if (args.args?.length) text += ` ${theme.fg("accent", args.args.join(" "))}`;
+        return new Text(text, 0, 0);
+      },
+      renderResult(result) {
+        const text = result.content.find((item) => item.type === "text")?.text ?? "";
+        return new Text(text, 0, 0);
+      },
+    });
+  }
 
   pi.on("session_start", async (_event, ctx) => {
     await restoreRepositoryIdentity(ctx);
     await discoverAliases(ctx);
-    registerWorktrunkAliasTool();
+    registerTool();
     await tracker.markWaiting(ctx.cwd);
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
