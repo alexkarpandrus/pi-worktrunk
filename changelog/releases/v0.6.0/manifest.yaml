@@ -1,0 +1,10 @@
+created: 2026-08-24
+title: Complete Worktrunk command guidance
+intro: >-
+  This release makes Worktrunk commands easier for Pi agents to use by providing complete
+  command trees, meaningful options, canonical examples, and clear separation of arguments.
+  Pi also asks for confirmation before running hooks or administrative commands that
+  change approvals, state, shell integration, or plugins.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.5.0
