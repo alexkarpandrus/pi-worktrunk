@@ -5,6 +5,7 @@
     "": {
       "name": "pi-worktrunk",
       "devDependencies": {
+        "@earendil-works/pi-agent-core": "0.84.3",
         "@types/node": "^24.0.0",
         "typescript": "^5.9.0",
       },

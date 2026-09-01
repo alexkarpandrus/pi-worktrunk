@@ -345,6 +345,29 @@ function exactSwitchTarget(invocation: Invocation): string | undefined {
   const value = invocation.commandArgs[0];
   return value.startsWith("-") ? undefined : value;
 }
+function positionalCommandArgs(invocation: Invocation): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < invocation.commandArgs.length; index += 1) {
+    const value = invocation.commandArgs[index];
+    if (GLOBAL_OPTIONS_WITH_VALUES.has(value)) { index += 1; continue; }
+    if (
+      (value.startsWith("-C") && value !== "-C") ||
+      value.startsWith("--config=") ||
+      value.startsWith("--config-set=") ||
+      value.startsWith("-")
+    ) continue;
+    result.push(value);
+  }
+  return result;
+}
+function nonInteractivePlacementCommand(invocation: Invocation): string | undefined {
+  if (invocation.command === "switch") return "wt switch";
+  if (invocation.command === "step" && positionalCommandArgs(invocation)[0] === "promote") {
+    return "wt step promote";
+  }
+  return undefined;
+}
+
 function relationText(relation?: Relation): string { return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`; }
 function changeText(item: WorktreeItem): string {
   const changes = item.worktree?.changes ?? {};
@@ -784,8 +807,9 @@ export default function extension(pi: ExtensionAPI) {
         }
 
         if (ctx.mode === "print" || ctx.mode === "json") {
-          if (invocation.command === "switch") {
-            throw new WorktrunkError("`wt switch` requires TUI or RPC mode so Pi can move to the target worktree.");
+          const placementCommand = nonInteractivePlacementCommand(invocation);
+          if (placementCommand) {
+            throw new WorktrunkError(`\`${placementCommand}\` requires TUI or RPC mode so Pi can preserve session placement.`);
           }
           const result = await runWt(args, { cwd: ctx.cwd, signal: _signal, cwdMode: "repository-read" });
           const output = boundedModelOutput(
@@ -793,6 +817,7 @@ export default function extension(pi: ExtensionAPI) {
           );
           const details = { args, code: result.code };
           if (!existsSync(ctx.cwd)) {
+            ctx.abort();
             return {
               content: [{
                 type: "text" as const,

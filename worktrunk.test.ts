@@ -5,6 +5,8 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
+import { Agent } from "@earendil-works/pi-agent-core";
+import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { WORKTRUNK_REFERENCE_VERSION } from "./worktrunk-reference.ts";
@@ -196,6 +198,7 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
   const tools = new Map<string, any>();
   const sent: Array<{ text: string; options: any }> = [];
   const calls: string[][] = [];
+  let abortCalls = 0;
   extension(baseApi({
     handlers, commands, tools, sent,
     async exec(program, args, options) {
@@ -228,6 +231,17 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
     assert.equal(result.terminate, undefined);
     assert.equal(result.content[0].text, "main worktree");
     assert.deepEqual(result.details, { args: ["list"], code: 0 });
+
+    await assert.rejects(
+      tools.get("worktrunk").execute(
+        `promote-${mode}`,
+        { command: "step", args: ["promote", "feature"] },
+        undefined,
+        undefined,
+        { cwd: process.cwd(), mode, hasUI: false, ui: {} },
+      ),
+      /requires TUI or RPC mode/,
+    );
   }
 
   await assert.rejects(
@@ -258,15 +272,90 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
       { command: "remove", args: ["current"] },
       undefined,
       undefined,
-      { cwd: removedCwd, mode: "print", hasUI: false, ui: {} },
+      { cwd: removedCwd, mode: "print", hasUI: false, ui: {}, abort: () => { abortCalls += 1; } },
     );
     assert.equal(removed.terminate, true);
     assert.match(removed.content[0].text, /working directory no longer exists/);
+    assert.equal(abortCalls, 1);
   } finally {
     await rm(removedCwd, { recursive: true, force: true });
   }
   assert.deepEqual(calls, [["list"], ["list"], ["list", "--large"], ["remove", "current"]]);
   assert.deepEqual(sent, []);
+});
+
+test("removing the current worktree aborts the remaining tool batch", async () => {
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  extension(baseApi({
+    handlers, commands, tools,
+    async exec(program, args, options) {
+      if (program === "git") return { code: 1, stdout: "", stderr: "" };
+      if (args[0] === "--help" || args[0] === "--version" || args[0] === "config") {
+        return { code: 0, stdout: "" };
+      }
+      if (args[0] === "remove") {
+        await rm(options.cwd, { recursive: true, force: true });
+        return { code: 0, stdout: "removed\n" };
+      }
+      return { code: 0, stdout: "" };
+    },
+  }));
+  await handlers.get("session_start")({}, {
+    cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] },
+  });
+
+  const removedCwd = await mkdtemp(join(tmpdir(), "pi-worktrunk-batch-"));
+  try {
+    const registered = tools.get("worktrunk");
+    let remainingCalls = 0;
+    let agent: Agent;
+    const faux = createFauxCore({ models: [{ id: "test" }] });
+    faux.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("worktrunk", { command: "remove", args: ["current"] }, { id: "remove" }),
+        fauxToolCall("remaining", { command: "list" }, { id: "remaining" }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage("continued"),
+    ]);
+    const worktrunk = {
+      ...registered,
+      execute(id: string, args: unknown, signal: AbortSignal, update: unknown) {
+        return registered.execute(id, args, signal, update, {
+          cwd: removedCwd,
+          mode: "print",
+          hasUI: false,
+          ui: {},
+          abort: () => agent.abort(),
+        });
+      },
+    };
+    const remaining = {
+      name: "remaining",
+      description: "Runs after Worktrunk",
+      parameters: registered.parameters,
+      async execute() {
+        remainingCalls += 1;
+        return { content: [{ type: "text" as const, text: "ran" }], details: {} };
+      },
+    };
+    agent = new Agent({
+      initialState: {
+        systemPrompt: "",
+        model: faux.getModel(),
+        tools: [worktrunk, remaining],
+      },
+      streamFn: faux.streamSimple,
+    });
+
+    await agent.prompt("remove the current worktree");
+
+    assert.equal(remainingCalls, 0);
+    assert.equal(faux.state.callCount, 1);
+  } finally {
+    await rm(removedCwd, { recursive: true, force: true });
+  }
 });
 
 test("Worktrunk client handles relocated lists and failures", async () => {
