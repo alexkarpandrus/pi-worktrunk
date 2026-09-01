@@ -196,6 +196,11 @@ function approvalHint(output: string): string {
 function missingCwdMessage(cwd: string): string {
   return `Pi's working directory no longer exists: ${cwd}. Continue the session from an existing worktree or restart Pi there.`;
 }
+function boundedModelOutput(output: string): string {
+  return output.length > MAX_CONTINUATION_OUTPUT
+    ? `${output.slice(0, MAX_CONTINUATION_OUTPUT)}\n\n[output truncated]`
+    : output;
+}
 function formatWtFailure(args: readonly string[], result: WtResult, cwd: string): string {
   const output = [result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join("\n");
   if (result.killed) return `wt ${args.join(" ")} was cancelled.`;
@@ -764,7 +769,7 @@ export default function extension(pi: ExtensionAPI) {
         return value as { command: string; args?: string[] };
       },
       executionMode: "sequential",
-      async execute(_id, params, _signal, _update, _ctx) {
+      async execute(_id, params, _signal, _update, ctx) {
         const args = [params.command, ...(params.args ?? [])];
         const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
         if (isBareCommand(invocation, "switch")) {
@@ -778,6 +783,33 @@ export default function extension(pi: ExtensionAPI) {
           throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending.");
         }
 
+        if (ctx.mode === "print" || ctx.mode === "json") {
+          if (invocation.command === "switch") {
+            throw new WorktrunkError("`wt switch` requires TUI or RPC mode so Pi can move to the target worktree.");
+          }
+          const result = await runWt(args, { cwd: ctx.cwd, signal: _signal, cwdMode: "repository-read" });
+          const output = boundedModelOutput(
+            [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n"),
+          );
+          const details = { args, code: result.code };
+          if (!existsSync(ctx.cwd)) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: [output, missingCwdMessage(ctx.cwd)].filter(Boolean).join("\n\n"),
+              }],
+              details,
+              terminate: true,
+            };
+          }
+          if (result.code !== 0 || result.killed) {
+            throw new WorktrunkError(boundedModelOutput(formatWtFailure(args, result, ctx.cwd)));
+          }
+          return {
+            content: [{ type: "text" as const, text: output || `wt ${args.join(" ")} completed successfully.` }],
+            details,
+          };
+        }
         const nonce = randomUUID();
         placementInFlight = true;
         pendingContinuation = {
