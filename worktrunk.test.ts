@@ -5,9 +5,8 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { Agent } from "@earendil-works/pi-agent-core";
-import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { WORKTRUNK_REFERENCE_VERSION } from "./worktrunk-reference.ts";
 import extension, {
@@ -310,8 +309,7 @@ test("removing the current worktree aborts the remaining tool batch", async () =
   try {
     const registered = tools.get("worktrunk");
     let remainingCalls = 0;
-    let agent: Agent;
-    const faux = createFauxCore({ models: [{ id: "test" }] });
+    const faux = fauxProvider({ models: [{ id: "test" }] });
     faux.setResponses([
       fauxAssistantMessage([
         fauxToolCall("worktrunk", { command: "remove", args: ["current"] }, { id: "remove" }),
@@ -319,18 +317,8 @@ test("removing the current worktree aborts the remaining tool batch", async () =
       ], { stopReason: "toolUse" }),
       fauxAssistantMessage("continued"),
     ]);
-    const worktrunk = {
-      ...registered,
-      execute(id: string, args: unknown, signal: AbortSignal, update: unknown) {
-        return registered.execute(id, args, signal, update, {
-          cwd: removedCwd,
-          mode: "print",
-          hasUI: false,
-          ui: {},
-          abort: () => agent.abort(),
-        });
-      },
-    };
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+    modelRuntime.registerNativeProvider(faux.provider);
     const remaining = {
       name: "remaining",
       description: "Runs after Worktrunk",
@@ -340,19 +328,23 @@ test("removing the current worktree aborts the remaining tool batch", async () =
         return { content: [{ type: "text" as const, text: "ran" }], details: {} };
       },
     };
-    agent = new Agent({
-      initialState: {
-        systemPrompt: "",
-        model: faux.getModel(),
-        tools: [worktrunk, remaining],
-      },
-      streamFn: faux.streamSimple,
+    const { session } = await createAgentSession({
+      cwd: removedCwd,
+      agentDir: removedCwd,
+      model: faux.getModel(),
+      modelRuntime,
+      noTools: "builtin",
+      customTools: [registered, remaining],
+      sessionManager: SessionManager.inMemory(removedCwd),
     });
+    try {
+      await session.prompt("remove the current worktree");
 
-    await agent.prompt("remove the current worktree");
-
-    assert.equal(remainingCalls, 0);
-    assert.equal(faux.state.callCount, 1);
+      assert.equal(remainingCalls, 0);
+      assert.equal(faux.state.callCount, 1);
+    } finally {
+      session.dispose();
+    }
   } finally {
     await rm(removedCwd, { recursive: true, force: true });
   }
